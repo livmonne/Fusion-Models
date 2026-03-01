@@ -55,7 +55,7 @@ class FusionLoss(nn.Module):
 
     def __init__(
         self,
-        lambda_guess: float = 0.005,
+        lambda_guess: float = 0.01,
         lambda_storage: float = 0.001,
         lambda_entropy: float = 0.05,
         lambda_aux: float = 0.3,
