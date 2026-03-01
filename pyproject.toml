@@ -1,0 +1,74 @@
+# =============================================================================
+# Fusion Model — UV project configuration
+#
+# This file defines the project metadata, dependencies, and tool settings
+# for the Fusion Model proof-of-concept.  It replaces requirements.txt and
+# centralises configuration for ruff, mypy, and pytest in one place.
+# =============================================================================
+
+[project]
+name = "fusion-model"
+version = "0.1.0"
+description = "Fusion Model: memory + rule + guess + decision router for CLEVR VQA"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "numpy",
+    "matplotlib",
+    "pillow",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "pre-commit",
+]
+
+# ---------------------------------------------------------------------------
+# Build system — required by PEP 621 but UV does not build wheels by default.
+# ---------------------------------------------------------------------------
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ---------------------------------------------------------------------------
+# Ruff — fast Python linter and formatter.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# Enable a broad set of rules: pyflakes (F), pycodestyle (E/W), isort (I),
+# bugbear (B), and naming conventions (N).
+select = ["E", "F", "W", "I", "B", "N"]
+# Ignore rules that conflict with common deep-learning conventions.
+ignore = [
+    "N803",   # allow uppercase variable names like A, B, W (common in math)
+    "N806",   # allow uppercase variable names inside functions
+    "N812",   # allow `import torch.nn.functional as F` (universal PyTorch convention)
+    "E501",   # line length handled separately by formatter
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["fusion_model", "tasks"]
+
+# ---------------------------------------------------------------------------
+# mypy — static type checker.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false          # too strict for a prototype
+ignore_missing_imports = true          # third-party stubs not always available
+
+# ---------------------------------------------------------------------------
+# pytest — test runner.
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]

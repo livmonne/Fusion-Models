@@ -1,0 +1,31 @@
+# Virtual environment
+.venv/
+
+# CLEVR dataset (too large for version control)
+CLEVR_v1.0/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# mypy / ruff / pytest caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Training outputs (weights, history, plots)
+outputs/
+
+# Editor — share workspace settings but ignore everything else in .vscode
+.vscode/*
+!.vscode/settings.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# UV lock is fine to commit, but ignore the build artefacts
+*.egg-info/
+dist/
+build/

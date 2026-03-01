@@ -1,0 +1,27 @@
+# =============================================================================
+# Pre-commit hooks — run automatically before every ``git commit``.
+#
+# Install once with:   pre-commit install
+# Run manually with:   pre-commit run --all-files
+# =============================================================================
+
+repos:
+  # ── Ruff: linting + formatting ──────────────────────────────────────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      # Lint pass — catches style issues, unused imports, etc.
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      # Format pass — consistent code style (like black but faster).
+      - id: ruff-format
+
+  # ── mypy: static type checking ─────────────────────────────────────────
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.14.1
+    hooks:
+      - id: mypy
+        # Extra args forwarded to mypy.  We read config from pyproject.toml
+        # automatically so no --config-file flag is needed.
+        additional_dependencies: [torch, torchvision, numpy, matplotlib, pillow]
+        args: [--ignore-missing-imports]
