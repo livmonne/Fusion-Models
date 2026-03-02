@@ -103,14 +103,23 @@ class RuleGenerator(nn.Module):
         h_det = h.detach()
         dec_det = decisions.detach()
 
-        for i in range(batch):
-            idx = self.history_ptr.item()
-            self.history_h[idx] = h_det[i]
-            self.history_decisions[idx] = dec_det[i]
-            self.history_ptr = (self.history_ptr + 1) % self.history_size
-            self.history_count = torch.clamp(
-                self.history_count + 1, max=self.history_size
-            )
+        ptr = self.history_ptr.item()
+        end = ptr + batch
+
+        if end <= self.history_size:
+            self.history_h[ptr:end] = h_det
+            self.history_decisions[ptr:end] = dec_det
+        else:
+            first = self.history_size - ptr
+            self.history_h[ptr:] = h_det[:first]
+            self.history_decisions[ptr:] = dec_det[:first]
+            self.history_h[: end - self.history_size] = h_det[first:]
+            self.history_decisions[: end - self.history_size] = dec_det[first:]
+
+        self.history_ptr.fill_(end % self.history_size)
+        self.history_count.fill_(
+            min(self.history_count.item() + batch, self.history_size)
+        )
 
     # ── Rule proposal ────────────────────────────────────────────────────
 
