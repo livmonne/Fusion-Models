@@ -30,7 +30,7 @@ class RuleGenerator(nn.Module):
     """Generate ephemeral low-rank corrections and propose persistent rules.
 
     :param embed_dim: Dimensionality of the shared input embedding.
-    :param num_classes: Number of output classes (CLEVR answers).
+    :param num_classes: Number of output classes.
     :param rank: Inner rank of the generated low-rank matrices.
     :param hidden_dim: Width of the internal MLP.
     :param history_size: Capacity of the circular ``(h, decision)`` buffer.
@@ -57,7 +57,7 @@ class RuleGenerator(nn.Module):
         self.min_history = min_history
         self.decision_embed_dim = decision_embed_dim
 
-        # ── Ephemeral correction MLP (unchanged) ────────────────────────
+        # ── Ephemeral correction MLP  ────────────────────────
         out_dim = (rank * embed_dim) + (embed_dim * rank) + 1
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
@@ -69,9 +69,7 @@ class RuleGenerator(nn.Module):
 
         # ── History buffer (non-gradient circular buffer) ────────────────
         self.register_buffer("history_h", torch.zeros(history_size, embed_dim))
-        self.register_buffer(
-            "history_decisions", torch.full((history_size,), -1, dtype=torch.long)
-        )
+        self.register_buffer("history_decisions", torch.full((history_size,), -1, dtype=torch.long))
         self.register_buffer("history_ptr", torch.tensor(0, dtype=torch.long))
         self.register_buffer("history_count", torch.tensor(0, dtype=torch.long))
 
@@ -117,15 +115,11 @@ class RuleGenerator(nn.Module):
             self.history_decisions[: end - self.history_size] = dec_det[first:]
 
         self.history_ptr.fill_(end % self.history_size)
-        self.history_count.fill_(
-            min(self.history_count.item() + batch, self.history_size)
-        )
+        self.history_count.fill_(min(self.history_count.item() + batch, self.history_size))
 
     # ── Rule proposal ────────────────────────────────────────────────────
 
-    def propose_rule(
-        self, h: torch.Tensor
-    ) -> dict[str, torch.Tensor] | None:
+    def propose_rule(self, h: torch.Tensor) -> dict[str, torch.Tensor] | None:
         """Propose a persistent rule from current input + history context.
 
         Returns ``None`` when the history buffer has fewer than

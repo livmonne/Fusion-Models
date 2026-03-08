@@ -67,7 +67,7 @@ class RuleMemory(nn.Module):
 
         # Low-rank factors for each slot: correction = A @ (B @ h).
         # B compresses the embedding; A expands the compressed representation.
-        self.B = nn.Parameter(torch.randn(num_slots, rank, embed_dim) * 0.02)
+        self.B = nn.Parameter(torch.zeros(num_slots, rank, embed_dim))
         self.A = nn.Parameter(torch.randn(num_slots, embed_dim, rank) * 0.02)
 
         # Per-slot classification head packed into a single Linear for efficiency.
