@@ -24,8 +24,10 @@ Image (3×224×224)                  Question ("How many red cubes …")
        └── multi-head spatial attention (4 heads) ──┘
                       │
                img_emb (256)  ×  q_emb (256)
-                      │
-               fusion_proj (256→256)
+                      │               │
+               fusion_proj (256→256)  │  (residual)
+                      │               │
+                      └───── + ───────┘
                       │
                       h  (shared embedding)
                       │
@@ -33,11 +35,16 @@ Image (3×224×224)                  Question ("How many red cubes …")
        ▼              ▼              ▼
   RuleMemory    RuleGenerator   GuessComponent
        │              │              │
-  p_mem(y|x)    p_rule(y|x)    p_guess(y|x)
+  logits + repr  logits + repr  logits + repr
        │              │              │
-       └──────► DecisionRouter ◄─────┘
-                      │
-               α = softmax weights
+       ▼              ▼              ▼
+       ┌──────────────┼──────────────┐
+       │    DecisionRouter (cross-attention)
+       │    query = h
+       │    keys  = [mem_repr, rule_repr, guess_repr]
+       │              │
+       │       α = attn weights (3)
+       └──────────────┘
                       │
      p(y|x) = α_mem·p_mem + α_rule·p_rule + α_guess·p_guess
 ```
@@ -46,10 +53,10 @@ Image (3×224×224)                  Question ("How many red cubes …")
 
 | Component | Role |
 |---|---|
-| **RuleMemory** | Bank of 128 learned low-rank rules with trigger embeddings. Differentiable soft-attention retrieval. |
-| **RuleGenerator** | Proposes ephemeral one-shot rules as low-rank corrections per input. |
-| **GuessComponent** | Self-attention over pseudo-tokens followed by an MLP head for fuzzy patterns. |
-| **DecisionRouter** | Produces softmax mixture weights over the three pathways. |
+| **RuleMemory** | Bank of 128 learned low-rank rules with trigger embeddings. Differentiable soft-attention retrieval. Exposes blended correction vector for routing. |
+| **RuleGenerator** | Proposes ephemeral one-shot rules as low-rank corrections per input. Uses dual multi-head cross-attention over a circular history buffer to attend separately over past embeddings and past decisions when proposing persistent rules. Exposes correction vector for routing. |
+| **GuessComponent** | Self-attention over pseudo-tokens followed by an MLP head for fuzzy patterns. Exposes pooled representation for routing. |
+| **DecisionRouter** | Cross-attention router: uses ``h`` as query and each pathway's intermediate representation as keys to produce input-dependent mixture weights. |
 
 ## Quick Start
 

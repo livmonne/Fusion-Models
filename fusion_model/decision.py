@@ -1,21 +1,29 @@
-"""DecisionRouter — learns to mix the three pathways (memory, rule, guess).
+"""DecisionRouter — cross-attention router that mixes the three pathways.
 
-The router is the *arbiter* of the Fusion Model.  Given the shared embedding
-plus summary signals from the memory and rule-generator pathways, it outputs
-a three-element probability vector:
+The router is the *arbiter* of the Fusion Model.  Rather than concatenating
+summary signals into a flat vector and passing them through an MLP, the
+router uses **cross-attention**: the shared embedding ``h`` serves as the
+*query*, and each expert pathway provides a *key/value* token summarising
+what it can offer for the current input.
 
-    ``alpha = [alpha_mem, alpha_rule, alpha_guess]``
+The attention weights over the three pathway tokens directly yield the
+mixture coefficients:
 
-These weights are applied to the logits of each pathway so that the final
-prediction is a soft mixture:
+    ``alpha = softmax(q · K^T / sqrt(d))``
+
+so that the final prediction is a soft mixture:
 
     ``p(y|x) = alpha_mem * p_mem + alpha_rule * p_rule + alpha_guess * p_guess``
 
-Early in training the entropy regulariser in the loss keeps the weights
-close to uniform so that every pathway gets gradient signal.  As the model
-converges the router learns to specialise — ideally pushing structured /
-rule-amenable questions towards the rule pathways and fuzzy questions
-towards the guess pathway.
+Because attention is inherently input-dependent, the router can learn
+*dynamic* relationships between the fused context and each expert's
+intermediate representation — something a static MLP over concatenated
+features cannot do.
+
+A learnable temperature parameter controls the sharpness of the routing
+distribution: low temperature → peaky (hard routing), high temperature →
+uniform (soft routing).  The entropy regulariser in the loss still applies
+and interacts naturally with this temperature.
 """
 
 from __future__ import annotations
@@ -26,40 +34,64 @@ import torch.nn.functional as F
 
 
 class DecisionRouter(nn.Module):
-    """Two-layer MLP that produces softmax mixture weights over three pathways.
+    """Cross-attention router that produces softmax mixture weights over three
+    expert pathways.
 
-    :param embed_dim: Dimensionality of the shared input embedding.
-    :param hidden_dim: Width of the router's hidden layer.
+    The shared embedding ``h`` is projected into a query vector, while each
+    pathway's intermediate representation is projected into key/value space.
+    A single-head scaled-dot-product attention over the three pathway tokens
+    yields the routing weights directly.
+
+    :param embed_dim: Dimensionality of the shared input embedding and of
+        each pathway's intermediate representation.
+    :param num_heads: Number of attention heads.  Defaults to 1 so that the
+        attention weights map cleanly onto the three routing coefficients.
     """
 
-    def __init__(self, embed_dim: int = 256, hidden_dim: int = 128) -> None:
+    def __init__(self, embed_dim: int = 256, num_heads: int = 1) -> None:
         super().__init__()
-        # The router sees three things concatenated:
-        #   1. The shared embedding  h            (embed_dim)
-        #   2. The top retrieved memory key       (embed_dim)
-        #   3. The rule-generator confidence      (1)
-        input_dim = embed_dim + embed_dim + 1
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 3),  # one logit per pathway
-        )
+        self.embed_dim = embed_dim
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+
+        self.temperature = nn.Parameter(torch.tensor(1.0))
 
     def forward(
         self,
         h: torch.Tensor,
-        retrieval_top_key: torch.Tensor,
-        rule_confidence: torch.Tensor,
+        mem_repr: torch.Tensor,
+        rule_repr: torch.Tensor,
+        guess_repr: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute routing weights.
+        """Compute routing weights via cross-attention.
 
-        :param h: Shared embedding ``(batch, embed_dim)``.
-        :param retrieval_top_key: Key of the best-matching memory rule
-            ``(batch, embed_dim)``.
-        :param rule_confidence: Generator confidence ``(batch, 1)``.
+        :param h: Shared embedding ``(batch, embed_dim)`` — used as the
+            attention query.
+        :param mem_repr: Memory pathway intermediate representation
+            ``(batch, embed_dim)`` — the blended correction vector from
+            :class:`~fusion_model.memory.RuleMemory`.
+        :param rule_repr: Rule pathway intermediate representation
+            ``(batch, embed_dim)`` — the ephemeral correction vector from
+            :class:`~fusion_model.rule_engine.RuleGenerator`.
+        :param guess_repr: Guess pathway intermediate representation
+            ``(batch, embed_dim)`` — the pooled self-attention output from
+            :class:`~fusion_model.guess.GuessComponent`.
         :return: Softmax weights ``(batch, 3)`` —
             ``[alpha_mem, alpha_rule, alpha_guess]``.
         """
-        x = torch.cat([h, retrieval_top_key, rule_confidence], dim=-1)
-        alpha: torch.Tensor = F.softmax(self.mlp(x), dim=-1)
+        query = self.q_proj(h)  # (batch, embed_dim)
+
+        pathway_tokens = torch.stack(
+            [mem_repr, rule_repr, guess_repr], dim=1,
+        )  # (batch, 3, embed_dim)
+        keys = self.k_proj(pathway_tokens)  # (batch, 3, embed_dim)
+
+        scale = self.embed_dim ** 0.5
+        attn_logits = torch.bmm(
+            query.unsqueeze(1), keys.transpose(1, 2),
+        ).squeeze(1)  # (batch, 3)
+
+        temp = self.temperature.clamp(min=0.01)
+        alpha: torch.Tensor = F.softmax(attn_logits / (scale * temp), dim=-1)
         return alpha

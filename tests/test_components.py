@@ -30,20 +30,20 @@ class TestRuleMemory:
     """Tests for :class:`fusion_model.memory.RuleMemory`."""
 
     def test_output_shapes(self) -> None:
-        """Logits and retrieval info must have the expected shapes."""
+        """Logits, blended correction, and retrieval info must have the expected shapes."""
         mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
         h = torch.randn(BATCH, EMBED)
-        logits, info = mem(h)
+        logits, blended, info = mem(h)
 
         assert logits.shape == (BATCH, N_CLASSES)
+        assert blended.shape == (BATCH, EMBED)
         assert info["scores"].shape == (BATCH, N_SLOTS)
-        assert info["top_key"].shape == (BATCH, EMBED)
 
     def test_scores_sum_to_one(self) -> None:
         """Retrieval scores must be valid softmax probabilities."""
         mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
         h = torch.randn(BATCH, EMBED)
-        _, info = mem(h)
+        _, _, info = mem(h)
         sums = info["scores"].sum(dim=-1)
         assert torch.allclose(sums, torch.ones(BATCH), atol=1e-5)
 
@@ -52,31 +52,63 @@ class TestRuleGenerator:
     """Tests for :class:`fusion_model.rule_engine.RuleGenerator`."""
 
     def test_output_shapes(self) -> None:
-        """Logits and confidence must have the expected shapes."""
+        """Logits, confidence, and correction must have the expected shapes."""
         gen = RuleGenerator(embed_dim=EMBED, num_classes=N_CLASSES, rank=RANK)
         h = torch.randn(BATCH, EMBED)
-        logits, confidence, _proposal = gen(h)
+        logits, confidence, correction, _proposal = gen(h)
 
         assert logits.shape == (BATCH, N_CLASSES)
         assert confidence.shape == (BATCH, 1)
+        assert correction.shape == (BATCH, EMBED)
 
     def test_confidence_range(self) -> None:
         """Confidence must lie in [0, 1] (sigmoid output)."""
         gen = RuleGenerator(embed_dim=EMBED, num_classes=N_CLASSES, rank=RANK)
         h = torch.randn(BATCH, EMBED)
-        _, confidence, _proposal = gen(h)
+        _, confidence, _, _proposal = gen(h)
         assert (confidence >= 0.0).all() and (confidence <= 1.0).all()
+
+    def test_proposal_shapes_after_history_fill(self) -> None:
+        """After enough history, propose_rule must return correctly shaped tensors."""
+        min_hist = 16
+        gen = RuleGenerator(
+            embed_dim=EMBED, num_classes=N_CLASSES, rank=RANK,
+            history_size=64, min_history=min_hist,
+        )
+        gen.train()
+
+        for _ in range(min_hist // BATCH + 1):
+            h_fill = torch.randn(BATCH, EMBED)
+            decisions = torch.randint(0, N_CLASSES, (BATCH,))
+            gen.update_history(h_fill, decisions)
+
+        h = torch.randn(BATCH, EMBED)
+        proposal = gen.propose_rule(h)
+
+        assert proposal is not None
+        assert proposal["key"].shape == (BATCH, EMBED)
+        assert proposal["A"].shape == (BATCH, EMBED, RANK)
+        assert proposal["B"].shape == (BATCH, RANK, EMBED)
+        assert proposal["confidence"].shape == (BATCH, 1)
+        assert (proposal["confidence"] >= 0.0).all() and (proposal["confidence"] <= 1.0).all()
+
+    def test_proposal_none_before_min_history(self) -> None:
+        """propose_rule must return None when history is below min_history."""
+        gen = RuleGenerator(embed_dim=EMBED, num_classes=N_CLASSES, rank=RANK, min_history=64)
+        h = torch.randn(BATCH, EMBED)
+        assert gen.propose_rule(h) is None
 
 
 class TestGuessComponent:
     """Tests for :class:`fusion_model.guess.GuessComponent`."""
 
-    def test_output_shape(self) -> None:
-        """Output logits must match (batch, num_classes)."""
+    def test_output_shapes(self) -> None:
+        """Output logits and pooled representation must have expected shapes."""
         guess = GuessComponent(embed_dim=EMBED, num_classes=N_CLASSES, num_tokens=8)
         h = torch.randn(BATCH, EMBED)
-        logits = guess(h)
+        logits, pooled = guess(h)
         assert logits.shape == (BATCH, N_CLASSES)
+        assert pooled.shape == (BATCH, EMBED)
 
 
 class TestDecisionRouter:
@@ -86,9 +118,10 @@ class TestDecisionRouter:
         """Routing weights must be (batch, 3) and sum to 1."""
         router = DecisionRouter(embed_dim=EMBED)
         h = torch.randn(BATCH, EMBED)
-        top_key = torch.randn(BATCH, EMBED)
-        confidence = torch.rand(BATCH, 1)
-        alpha = router(h, top_key, confidence)
+        mem_repr = torch.randn(BATCH, EMBED)
+        rule_repr = torch.randn(BATCH, EMBED)
+        guess_repr = torch.randn(BATCH, EMBED)
+        alpha = router(h, mem_repr, rule_repr, guess_repr)
 
         assert alpha.shape == (BATCH, 3)
         assert torch.allclose(alpha.sum(dim=-1), torch.ones(BATCH), atol=1e-5)

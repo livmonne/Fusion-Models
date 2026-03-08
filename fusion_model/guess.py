@@ -64,11 +64,14 @@ class GuessComponent(nn.Module):
             nn.Linear(head_hidden, num_classes),
         )
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute guess-pathway logits from the shared embedding.
 
         :param h: Shared embedding of shape ``(batch, embed_dim)``.
-        :return: Logits of shape ``(batch, num_classes)``.
+        :return: Tuple of ``(logits, pooled)`` where *logits* has shape
+            ``(batch, num_classes)`` and *pooled* is the intermediate
+            representation ``(batch, embed_dim)`` before the classification
+            head (used by the :class:`~fusion_model.decision.DecisionRouter`).
         """
         batch = h.shape[0]
 
@@ -92,4 +95,4 @@ class GuessComponent(nn.Module):
         # -- 4. Mean-pool tokens back into one vector, then classify. --
         pooled = tokens.reshape(batch, -1)  # (batch, embed_dim)
         logits_guess: torch.Tensor = self.head(pooled)
-        return logits_guess
+        return logits_guess, pooled

@@ -18,18 +18,27 @@ distribution over a fixed set of answers.
    reference object), and their outputs are concatenated into a single
    attended image vector of shape ``(batch, embed_dim)``.
 4. **Multimodal fusion** — the attended image vector and question vector
-   are combined (element-wise product + linear projection) into a single
-   shared embedding ``h``.
-5. **Three expert pathways** each process ``h`` independently:
-   - :class:`~fusion_model.memory.RuleMemory` — retrieves stored rules.
+   are combined via element-wise product, linear projection, and a
+   residual connection from the question embedding, producing the shared
+   embedding ``h``.
+5. **Three expert pathways** each process ``h`` independently and return
+   both classification logits *and* an intermediate representation vector:
+   - :class:`~fusion_model.memory.RuleMemory` — retrieves stored rules;
+     exposes the blended correction vector.
    - :class:`~fusion_model.rule_engine.RuleGenerator` — produces ephemeral
-     corrections *and* proposes persistent rules for the memory bank.
-   - :class:`~fusion_model.guess.GuessComponent` — self-attention predictor.
+     corrections *and* proposes persistent rules for the memory bank via
+     dual multi-head cross-attention over its history buffer; exposes the
+     ephemeral correction vector.
+   - :class:`~fusion_model.guess.GuessComponent` — self-attention predictor;
+     exposes the pooled self-attention output.
 6. **Rule commitment** — if the RuleGenerator's proposal confidence exceeds
    a learnable threshold, the proposed rule is written into the
    lowest-utility slot of the memory bank.
-7. **DecisionRouter** — produces softmax mixture weights ``alpha`` over the
-   three pathways.
+7. **DecisionRouter** — uses **cross-attention** to produce softmax mixture
+   weights ``alpha`` over the three pathways.  The shared embedding ``h``
+   serves as the query, and each pathway's intermediate representation
+   serves as a key, so the router can dynamically compare what the model
+   needs against what each expert offers.
 8. **History update** — the current ``(h, prediction)`` pair is appended to
    the RuleGenerator's circular history buffer (training only).
 9. **Output** — the final logits are the weighted sum of the pathway logits.
@@ -115,7 +124,9 @@ class FusionModel(nn.Module):
         self.question_proj = nn.Linear(q_hidden_dim, embed_dim)
 
         # ── Multimodal fusion ────────────────────────────────────────────
-        # Element-wise product followed by a linear layer to blend modalities.
+        # Element-wise product followed by a linear projection + GELU, with
+        # a residual connection from the question embedding so that raw
+        # linguistic signal is always available to downstream pathways.
         self.fusion_proj = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
@@ -175,16 +186,16 @@ class FusionModel(nn.Module):
         )                                    # (batch, 1, embed_dim)
         img_emb = img_emb.squeeze(1)         # (batch, embed_dim)
 
-        # ── Fuse modalities via element-wise product + projection ────────
-        h = self.fusion_proj(img_emb * q_emb)  # (batch, embed_dim)
+        # ── Fuse modalities via element-wise product + projection + residual
+        h = self.fusion_proj(img_emb * q_emb) + q_emb  # (batch, embed_dim)
 
         # ── Expert pathways ──────────────────────────────────────────────
-        logits_mem, retrieval_info = self.memory(h)
-        logits_rule, confidence, proposal = self.rule_gen(h)
-        logits_guess = self.guess(h)
+        logits_mem, mem_repr, retrieval_info = self.memory(h)
+        logits_rule, confidence, rule_repr, proposal = self.rule_gen(h)
+        logits_guess, guess_repr = self.guess(h)
 
         # ── Route and blend ──────────────────────────────────────────────
-        alpha = self.router(h, retrieval_info["top_key"], confidence)
+        alpha = self.router(h, mem_repr, rule_repr, guess_repr)
 
         # Weighted mixture: each alpha slice is (batch, 1) for broadcasting.
         logits = (

@@ -78,13 +78,16 @@ class RuleMemory(nn.Module):
         self.utility: torch.Tensor
         self.register_buffer("utility", torch.zeros(num_slots))
 
-    def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Retrieve relevant rules and produce memory-pathway logits.
 
         :param h: Shared input embedding of shape ``(batch, embed_dim)``.
-        :return: Tuple of ``(logits_mem, retrieval_info)`` where
-            ``logits_mem`` has shape ``(batch, num_classes)`` and
-            ``retrieval_info`` is a dict with ``scores`` and ``top_key``.
+        :return: Tuple of ``(logits_mem, blended_correction, retrieval_info)``
+            where ``logits_mem`` has shape ``(batch, num_classes)``,
+            ``blended_correction`` is the score-weighted sum of per-slot
+            corrections ``(batch, embed_dim)`` before the classification
+            heads (used by the :class:`~fusion_model.decision.DecisionRouter`),
+            and ``retrieval_info`` is a dict with ``scores``.
         """
         # -- 1. Compute relevance of every rule slot via scaled dot-product. --
         # Shape: (batch, num_slots)
@@ -98,19 +101,19 @@ class RuleMemory(nn.Module):
         #   correction(b, s, e) = A(s, e, r) · compressed(b, s, r)
         correction = torch.einsum("ser, bsr -> bse", self.A, compressed)
 
-        # -- 3. Project each slot's correction to answer logits. --
+        # -- 3. Blend corrections using relevance scores. --
+        # blended(b, e) = Σ_s  scores(b, s) · correction(b, s, e)
+        blended_correction = torch.einsum("bs, bse -> be", scores, correction)
+
+        # -- 4. Project each slot's correction to answer logits. --
         # Reshape the packed weight into (num_slots, num_classes, embed_dim).
         w_heads = self.heads.weight.view(self.num_slots, -1, self.embed_dim)
         # slot_logits(b, s, c) = correction(b, s, e) · W(s, c, e)
         slot_logits = torch.einsum("bse, sce -> bsc", correction, w_heads)
 
-        # -- 4. Blend slot logits using their relevance scores. --
+        # -- 5. Blend slot logits using their relevance scores. --
         # logits_mem(b, c) = Σ_s  scores(b, s) · slot_logits(b, s, c)
         logits_mem = torch.einsum("bs, bsc -> bc", scores, slot_logits)
-
-        # -- 5. Return the top-matched key so the router can see it. --
-        top_idx = scores.argmax(dim=-1)  # (batch,)
-        top_key = self.keys[top_idx]  # (batch, embed_dim)
 
         # -- 6. Track per-slot utility (exponential moving average). --
         if self.training:
@@ -120,9 +123,8 @@ class RuleMemory(nn.Module):
 
         retrieval_info: dict[str, torch.Tensor] = {
             "scores": scores,
-            "top_key": top_key,
         }
-        return logits_mem, retrieval_info
+        return logits_mem, blended_correction, retrieval_info
 
     # ── Rule commitment ──────────────────────────────────────────────────
 

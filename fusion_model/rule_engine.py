@@ -8,12 +8,16 @@
    only.
 
 2. **Rule proposal** — the generator maintains a circular history buffer of
-   recent ``(h, prediction)`` pairs.  Using scaled-dot-product attention over
-   this buffer, it produces a *proposed persistent rule* — a ``(key, A, B)``
-   triple together with a proposal confidence.  When that confidence exceeds
-   a **learnable commitment threshold**, the rule is committed to the
-   :class:`~fusion_model.memory.RuleMemory` bank (handled by the orchestrator
-   in :class:`~fusion_model.model.FusionModel`).
+   recent ``(h, prediction)`` pairs.  Two separate **multi-head cross-attention**
+   blocks attend over this buffer — one reads out history embeddings and the
+   other reads out decision embeddings (projected to ``embed_dim``) — so the
+   model can learn independent relevance patterns for *what happened* vs.
+   *what was decided*.  The attended context is concatenated with ``h`` and
+   fed through an MLP to produce a *proposed persistent rule* — a
+   ``(key, A, B)`` triple together with a proposal confidence.  When that
+   confidence exceeds a **learnable commitment threshold**, the rule is
+   committed to the :class:`~fusion_model.memory.RuleMemory` bank (handled
+   by the orchestrator in :class:`~fusion_model.model.FusionModel`).
 
 This two-tier design lets the model invent hypotheses on the fly *and*
 distill recurring patterns into the long-term rule bank.
@@ -23,11 +27,16 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class RuleGenerator(nn.Module):
     """Generate ephemeral low-rank corrections and propose persistent rules.
+
+    The rule proposer uses **dual multi-head cross-attention** over the
+    circular history buffer.  One attention block reads out past embeddings
+    and another reads out past decision embeddings (projected to
+    ``embed_dim``), allowing the model to learn independent relevance
+    patterns for historical context vs. historical decisions.
 
     :param embed_dim: Dimensionality of the shared input embedding.
     :param num_classes: Number of output classes.
@@ -36,7 +45,8 @@ class RuleGenerator(nn.Module):
     :param history_size: Capacity of the circular ``(h, decision)`` buffer.
     :param min_history: Minimum entries in the buffer before rule proposal
         is attempted.
-    :param decision_embed_dim: Embedding dimension for stored decision indices.
+    :param decision_embed_dim: Embedding dimension for stored decision
+        indices before projection to ``embed_dim``.
     """
 
     def __init__(
@@ -76,7 +86,18 @@ class RuleGenerator(nn.Module):
         # ── Rule proposer ────────────────────────────────────────────────
         self.decision_embed = nn.Embedding(num_classes, decision_embed_dim)
 
-        proposer_in = embed_dim + embed_dim + decision_embed_dim
+        # Cross-attention over history embeddings: query = h, key/value = valid_h.
+        self.history_cross_attn = nn.MultiheadAttention(
+            embed_dim, num_heads=4, batch_first=True,
+        )
+        # Cross-attention over decision embeddings: query = h, key/value = dec_emb
+        # projected to embed_dim so the attention heads have full width.
+        self.dec_proj = nn.Linear(decision_embed_dim, embed_dim)
+        self.dec_cross_attn = nn.MultiheadAttention(
+            embed_dim, num_heads=4, batch_first=True,
+        )
+
+        proposer_in = embed_dim + embed_dim + embed_dim
         proposer_out = embed_dim + (embed_dim * rank) + (rank * embed_dim) + 1
         self.rule_proposer = nn.Sequential(
             nn.Linear(proposer_in, hidden_dim),
@@ -122,8 +143,10 @@ class RuleGenerator(nn.Module):
     def propose_rule(self, h: torch.Tensor) -> dict[str, torch.Tensor] | None:
         """Propose a persistent rule from current input + history context.
 
-        Returns ``None`` when the history buffer has fewer than
-        ``min_history`` entries.
+        Uses dual multi-head cross-attention: ``h`` is the query, and the
+        history buffer supplies keys/values — one block for past embeddings,
+        another for past decision embeddings.  Returns ``None`` when the
+        history buffer has fewer than ``min_history`` entries.
 
         :param h: Shared embedding ``(batch, embed_dim)``.
         :return: Dict with ``key``, ``A``, ``B``, ``confidence`` (per batch
@@ -133,16 +156,22 @@ class RuleGenerator(nn.Module):
         if count < self.min_history:
             return None
 
+        batch = h.shape[0]
         valid_h = self.history_h[:count].clone()  # (count, embed_dim)
         valid_dec = self.history_decisions[:count].clone()  # (count,)
 
-        # Attend over history using current h as query.
-        attn_scores = torch.matmul(h, valid_h.t()) / (self.embed_dim**0.5)
-        attn_weights = F.softmax(attn_scores, dim=-1)  # (batch, count)
+        query = h.unsqueeze(1)  # (batch, 1, embed_dim)
 
-        attended_h = torch.matmul(attn_weights, valid_h)  # (batch, embed_dim)
-        dec_emb = self.decision_embed(valid_dec)  # (count, dec_embed_dim)
-        attended_dec = torch.matmul(attn_weights, dec_emb)  # (batch, dec_embed_dim)
+        # Cross-attend over history embeddings.
+        kv_h = valid_h.unsqueeze(0).expand(batch, -1, -1)  # (batch, count, embed_dim)
+        attended_h, _ = self.history_cross_attn(query, kv_h, kv_h)
+        attended_h = attended_h.squeeze(1)  # (batch, embed_dim)
+
+        # Cross-attend over decision embeddings (projected to embed_dim).
+        dec_emb = self.dec_proj(self.decision_embed(valid_dec))  # (count, embed_dim)
+        kv_dec = dec_emb.unsqueeze(0).expand(batch, -1, -1)  # (batch, count, embed_dim)
+        attended_dec, _ = self.dec_cross_attn(query, kv_dec, kv_dec)
+        attended_dec = attended_dec.squeeze(1)  # (batch, embed_dim)
 
         combined = torch.cat([h, attended_h, attended_dec], dim=-1)
         raw = self.rule_proposer(combined)  # (batch, proposer_out)
@@ -171,11 +200,14 @@ class RuleGenerator(nn.Module):
 
     def forward(
         self, h: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
-        """Produce ephemeral rule logits, confidence, and a rule proposal.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Produce ephemeral rule logits, confidence, correction, and a rule proposal.
 
         :param h: Shared embedding ``(batch, embed_dim)``.
-        :return: Tuple ``(logits_rule, confidence, proposal)`` where
+        :return: Tuple ``(logits_rule, confidence, correction, proposal)``
+            where *correction* is the ephemeral low-rank correction vector
+            ``(batch, embed_dim)`` before the classification head (used by
+            the :class:`~fusion_model.decision.DecisionRouter`), and
             *proposal* is the dict from :meth:`propose_rule` (or ``None``
             if insufficient history).
         """
@@ -198,4 +230,4 @@ class RuleGenerator(nn.Module):
 
         proposal = self.propose_rule(h)
 
-        return logits_rule, confidence, proposal
+        return logits_rule, confidence, correction, proposal
