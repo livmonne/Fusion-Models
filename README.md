@@ -53,10 +53,34 @@ Image (3×224×224)                  Question ("How many red cubes …")
 
 | Component | Role |
 |---|---|
-| **RuleMemory** | Bank of 128 learned low-rank rules with trigger embeddings. Differentiable soft-attention retrieval. Supports soft-blend commitment of proposed rules. Exposes blended correction vector for routing. |
+| **RuleMemory** | Bank of 128 learned low-rank rules with trigger embeddings. Differentiable soft-attention retrieval **gated by memory strength** (frequency × recency). Learnable decay/reinforcement rates and recency half-life. Automatic pruning of forgotten slots. Supports soft-blend commitment of proposed rules. Exposes blended correction vector for routing. |
 | **RuleGenerator** | Proposes ephemeral one-shot rules as low-rank corrections per input. Uses a three-stage cross-attention pipeline (history, decision, synthesis) over a circular history buffer to propose persistent rules with a learned soft commit weight. Exposes correction vector for routing. |
 | **GuessComponent** | Self-attention over pseudo-tokens followed by an MLP head for fuzzy patterns. Exposes pooled representation for routing. |
 | **DecisionRouter** | Cross-attention router: uses ``h`` as query and each pathway's intermediate representation as keys to produce input-dependent mixture weights. |
+
+### Memory Strength (Biologically-Inspired Decay & Reinforcement)
+
+Each rule-memory slot carries a **strength** value in `[0, 1]` that
+modulates how much it contributes during retrieval.  Strength is the
+product of two independent signals inspired by neuroscience:
+
+| Signal | What it captures | Mechanism |
+|---|---|---|
+| **Frequency** | How often the slot is triggered | Running accumulator: decayed each step by a **learnable decay rate**, boosted by a **learnable reinforcement rate** × batch-mean retrieval score. |
+| **Recency** | How recently the slot was last strongly activated | Exponential decay: `exp(-ln2 × steps_since_activation / half_life)` where `half_life` is a **learnable parameter**. |
+
+**`strength = frequency_score × recency_score`**
+
+All three dynamics parameters (decay rate, reinforcement rate, recency
+half-life) are **learnable** — stored as unconstrained logits and mapped
+through sigmoid/exp so the model discovers its own optimal
+forgetting/consolidation schedule via gradient descent.  A strength
+regularisation term in the loss prevents degenerate regimes (total amnesia
+or total saturation).
+
+Slots whose strength drops below a configurable threshold are **pruned**:
+their parameters are re-initialised with small random values and given a
+moderate starting frequency, recycling capacity for new rules.
 
 ## Quick Start
 

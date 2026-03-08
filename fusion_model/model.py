@@ -23,8 +23,9 @@ distribution over a fixed set of answers.
    embedding ``h``.
 5. **Three expert pathways** each process ``h`` independently and return
    both classification logits *and* an intermediate representation vector:
-   - :class:`~fusion_model.memory.RuleMemory` — retrieves stored rules;
-     exposes the blended correction vector.
+   - :class:`~fusion_model.memory.RuleMemory` — retrieves stored rules
+     with **strength-gated** retrieval (weak/stale memories contribute
+     less); exposes the blended correction vector.
    - :class:`~fusion_model.rule_engine.RuleGenerator` — produces ephemeral
      corrections *and* proposes persistent rules for the memory bank via a
      three-stage cross-attention pipeline (history, decision, synthesis)
@@ -34,8 +35,10 @@ distribution over a fixed set of answers.
 6. **Rule commitment** — the RuleGenerator's proposal includes a learned
    **soft commit weight** derived from cosine similarity between the
    proposed key and ``h``.  The proposed rule is soft-blended into the
-   lowest-utility memory slot using this weight, preserving existing slot
-   content proportionally rather than hard-overwriting.
+   **weakest** memory slot (lowest combined strength) using this weight,
+   preserving existing slot content proportionally rather than
+   hard-overwriting.  The committed slot's strength signals are reset so
+   it starts with a fair chance of survival.
 7. **DecisionRouter** — uses **cross-attention** to produce softmax mixture
    weights ``alpha`` over the three pathways.  The shared embedding ``h``
    serves as the query, and each pathway's intermediate representation
@@ -204,7 +207,7 @@ class FusionModel(nn.Module):
             alpha[:, 0:1] * logits_mem + alpha[:, 1:2] * logits_rule + alpha[:, 2:3] * logits_guess
         )
 
-        # ── Rule commitment (soft blend) ────────────────────────────────
+        # ── Rule commitment (soft blend into weakest slot) ────────────────
         committed = False
         commit_weight_used = 0.0
         if self.training and proposal is not None:
@@ -213,7 +216,7 @@ class FusionModel(nn.Module):
             w = weights[best_idx, 0].item()
 
             if w > 1e-3:
-                slot = self.memory.get_lowest_utility_slot()
+                slot = self.memory.get_weakest_slot()
                 self.memory.commit_rule(
                     slot,
                     proposal["key"][best_idx],
@@ -234,6 +237,7 @@ class FusionModel(nn.Module):
             "logits_rule": logits_rule,
             "logits_guess": logits_guess,
             "retrieval_scores": retrieval_info["scores"],
+            "memory_strength": retrieval_info["strength"],
             "rule_confidence": confidence,
             "proposal": proposal,
             "committed": committed,

@@ -38,14 +38,92 @@ class TestRuleMemory:
         assert logits.shape == (BATCH, N_CLASSES)
         assert blended.shape == (BATCH, EMBED)
         assert info["scores"].shape == (BATCH, N_SLOTS)
+        assert info["strength"].shape == (N_SLOTS,)
 
     def test_scores_sum_to_one(self) -> None:
-        """Retrieval scores must be valid softmax probabilities."""
+        """Strength-gated retrieval scores must be valid probabilities."""
         mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
         h = torch.randn(BATCH, EMBED)
         _, _, info = mem(h)
         sums = info["scores"].sum(dim=-1)
         assert torch.allclose(sums, torch.ones(BATCH), atol=1e-5)
+
+    def test_strength_in_unit_interval(self) -> None:
+        """Memory strength values must lie in [0, 1]."""
+        mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
+        strength = mem.get_strength()
+        assert (strength >= 0.0).all() and (strength <= 1.0).all()
+
+    def test_frequency_decays_over_time(self) -> None:
+        """Frequency should decay toward zero when no retrieval happens.
+
+        We isolate the decay by zeroing out the reinforcement rate logit
+        (sigmoid → 0.5, but we set it very negative so reinforcement ≈ 0)
+        and running many forward passes.
+        """
+        mem = RuleMemory(
+            embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK,
+            prune_every_n_steps=0,
+        )
+        mem.train()
+        mem.frequency.fill_(0.8)
+        mem.steps_since_activation.zero_()
+
+        # Suppress reinforcement so decay dominates.
+        with torch.no_grad():
+            mem.reinforce_rate_logit.fill_(-20.0)
+
+        h = torch.randn(BATCH, EMBED)
+        for _ in range(100):
+            mem(h)
+
+        assert (mem.frequency < 0.8).all(), (
+            "Frequency should decrease when reinforcement is suppressed"
+        )
+
+    def test_prune_weak_slots_resets_parameters(self) -> None:
+        """Pruning should recycle dead slots and reset their strength."""
+        mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
+        # Force all slots into a "forgotten" state.
+        mem.frequency.fill_(0.01)
+        mem.steps_since_activation.fill_(10000.0)
+
+        n_pruned = mem.prune_weak_slots(threshold=0.5)
+        assert n_pruned == N_SLOTS
+        assert (mem.frequency == 0.5).all()
+        assert (mem.steps_since_activation == 0.0).all()
+
+    def test_commit_rule_resets_strength(self) -> None:
+        """Committing a rule should give the target slot a warm start."""
+        mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
+        mem.frequency.fill_(0.0)
+        mem.steps_since_activation.fill_(999.0)
+
+        key = torch.randn(EMBED)
+        A = torch.randn(EMBED, RANK)
+        B = torch.randn(RANK, EMBED)
+        mem.commit_rule(0, key, A, B, commit_weight=0.7)
+
+        assert torch.allclose(mem.frequency[0], torch.tensor(0.7), atol=1e-5)
+        assert mem.steps_since_activation[0].item() == 0.0
+
+    def test_get_weakest_slot_prefers_low_strength(self) -> None:
+        """get_weakest_slot should return the slot with lowest strength."""
+        mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
+        mem.frequency.fill_(0.9)
+        mem.steps_since_activation.zero_()
+        mem.frequency[3] = 0.01
+        mem.steps_since_activation[3] = 10000.0
+
+        assert mem.get_weakest_slot() == 3
+
+    def test_learnable_rates_are_parameters(self) -> None:
+        """Decay rate, reinforcement rate, and recency half-life must be nn.Parameters."""
+        mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
+        param_names = {name for name, _ in mem.named_parameters()}
+        assert "decay_rate_logit" in param_names
+        assert "reinforce_rate_logit" in param_names
+        assert "recency_halflife_log" in param_names
 
 
 class TestRuleGenerator:
@@ -165,3 +243,5 @@ class TestFusionModel:
         assert "logits_mem" in meta
         assert "logits_rule" in meta
         assert "logits_guess" in meta
+        assert "memory_strength" in meta
+        assert meta["memory_strength"].shape == (N_SLOTS,)

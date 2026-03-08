@@ -29,6 +29,14 @@ different failure mode of the mixture-of-experts architecture:
    parameters, preventing the model from committing too aggressively or
    never committing at all.
 
+7. **Strength regularisation** — penalises the deviation of the mean
+   memory-slot strength from a target occupancy.  This prevents two
+   degenerate regimes: (a) all slots decaying to zero (total amnesia) and
+   (b) all slots saturating at 1.0 (no forgetting, defeating the purpose
+   of the mechanism).  Because the strength depends on the learnable
+   decay rate, reinforcement rate, and recency half-life, this term
+   provides indirect gradient signal to those parameters.
+
 All penalty weights (``lambda_*``) are hyperparameters that may need tuning
 for different tasks.
 """
@@ -51,6 +59,10 @@ class FusionLoss(nn.Module):
     :param lambda_commit: Weight for commitment-rate regularisation.
     :param commit_target_rate: Desired mean commit weight across the batch
         (soft target).
+    :param lambda_strength: Weight for the memory-strength occupancy
+        regulariser.
+    :param strength_target: Desired mean slot strength.  Values around
+        0.4–0.6 encourage a healthy mix of strong and weak memories.
     """
 
     def __init__(
@@ -61,6 +73,8 @@ class FusionLoss(nn.Module):
         lambda_aux: float = 0.3,
         lambda_commit: float = 0.001,
         commit_target_rate: float = 0.1,
+        lambda_strength: float = 0.001,
+        strength_target: float = 0.5,
     ) -> None:
         super().__init__()
         self.lambda_guess = lambda_guess
@@ -69,6 +83,8 @@ class FusionLoss(nn.Module):
         self.lambda_aux = lambda_aux
         self.lambda_commit = lambda_commit
         self.commit_target_rate = commit_target_rate
+        self.lambda_strength = lambda_strength
+        self.strength_target = strength_target
         self.ce = nn.CrossEntropyLoss()
 
     def forward(
@@ -125,6 +141,18 @@ class FusionLoss(nn.Module):
                 mean_weight = commit_weight.squeeze(-1).mean()
                 commit_reg = (mean_weight - self.commit_target_rate) ** 2
 
+        # -- 7. Memory-strength occupancy regularisation. --
+        # Penalises deviation of mean slot strength from a healthy target,
+        # preventing total amnesia (all strengths → 0) or total saturation
+        # (all strengths → 1).  Indirectly provides gradient signal to the
+        # learnable decay rate, reinforcement rate, and recency half-life.
+        strength_reg = torch.tensor(0.0, device=logits.device)
+        if metadata is not None:
+            strength = metadata.get("memory_strength")
+            if strength is not None:
+                mean_strength = strength.mean()
+                strength_reg = (mean_strength - self.strength_target) ** 2
+
         # -- Combine everything. --
         total_loss: torch.Tensor = (
             task_loss
@@ -133,6 +161,7 @@ class FusionLoss(nn.Module):
             - self.lambda_entropy * entropy  # subtract because we *maximise* entropy
             + self.lambda_aux * aux_loss
             + self.lambda_commit * commit_reg
+            + self.lambda_strength * strength_reg
         )
 
         loss_dict: dict[str, float] = {
@@ -143,5 +172,6 @@ class FusionLoss(nn.Module):
             "entropy": entropy.item(),
             "aux": aux_loss.item(),
             "commit_reg": commit_reg.item(),
+            "strength_reg": strength_reg.item(),
         }
         return total_loss, loss_dict
