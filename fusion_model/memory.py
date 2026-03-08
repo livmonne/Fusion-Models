@@ -23,9 +23,10 @@ through the memory bank and the whole system is end-to-end trainable.
 The module maintains a running *utility* estimate (exponential moving average
 of each slot's mean retrieval score).  Low-utility slots are recycled by the
 :class:`~fusion_model.rule_engine.RuleGenerator` commitment mechanism: when
-the generator proposes a high-confidence rule, it is written into the
-lowest-utility slot via :meth:`commit_rule`, giving the bank a warm start
-for newly discovered patterns.
+the generator proposes a rule, it is **soft-blended** into the lowest-utility
+slot via :meth:`commit_rule` using a learned commit weight, giving the bank a
+warm start for newly discovered patterns while preserving existing slot
+content proportionally.
 """
 
 from __future__ import annotations
@@ -40,8 +41,9 @@ class RuleMemory(nn.Module):
 
     Slots are initialised randomly and refined via gradient descent.
     Additionally, the :class:`~fusion_model.rule_engine.RuleGenerator` may
-    *commit* high-confidence proposed rules into the bank by overwriting the
-    lowest-utility slot (see :meth:`commit_rule`).
+    *commit* proposed rules into the bank by **soft-blending** them into the
+    lowest-utility slot (see :meth:`commit_rule`), where the blend weight is
+    determined by the generator's learned commit weight.
 
     :param embed_dim: Dimensionality of the shared input embedding.
     :param num_classes: Number of output classes (CLEVR answers).
@@ -139,15 +141,24 @@ class RuleMemory(nn.Module):
         key: torch.Tensor,
         A: torch.Tensor,
         B: torch.Tensor,
+        commit_weight: float = 1.0,
     ) -> None:
-        """Overwrite a slot with a proposed rule.
+        """Soft-blend a proposed rule into a slot.
+
+        When ``commit_weight`` is 1.0 the slot is fully overwritten (legacy
+        behaviour).  For values in (0, 1) the slot parameters are linearly
+        interpolated: ``slot = w * proposed + (1 - w) * slot``, preserving
+        existing content proportionally.
 
         :param slot_idx: Target slot index in ``[0, num_slots)``.
         :param key: Trigger embedding ``(embed_dim,)``.
         :param A: Low-rank factor ``(embed_dim, rank)``.
         :param B: Low-rank factor ``(rank, embed_dim)``.
+        :param commit_weight: Blend weight in ``[0, 1]``.  1.0 = full
+            overwrite, 0.0 = no change.
         """
-        self.keys.data[slot_idx].copy_(key)
-        self.A.data[slot_idx].copy_(A)
-        self.B.data[slot_idx].copy_(B)
-        self.utility[slot_idx] = 0.0
+        w = commit_weight
+        self.keys.data[slot_idx].lerp_(key, w)
+        self.A.data[slot_idx].lerp_(A, w)
+        self.B.data[slot_idx].lerp_(B, w)
+        self.utility[slot_idx] *= 1.0 - w

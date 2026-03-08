@@ -89,8 +89,8 @@ class TestRuleGenerator:
         assert proposal["key"].shape == (BATCH, EMBED)
         assert proposal["A"].shape == (BATCH, EMBED, RANK)
         assert proposal["B"].shape == (BATCH, RANK, EMBED)
-        assert proposal["confidence"].shape == (BATCH, 1)
-        assert (proposal["confidence"] >= 0.0).all() and (proposal["confidence"] <= 1.0).all()
+        assert proposal["commit_weight"].shape == (BATCH, 1)
+        assert (proposal["commit_weight"] >= 0.0).all() and (proposal["commit_weight"] <= 1.0).all()
 
     def test_proposal_none_before_min_history(self) -> None:
         """propose_rule must return None when history is below min_history."""

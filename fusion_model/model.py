@@ -26,14 +26,16 @@ distribution over a fixed set of answers.
    - :class:`~fusion_model.memory.RuleMemory` — retrieves stored rules;
      exposes the blended correction vector.
    - :class:`~fusion_model.rule_engine.RuleGenerator` — produces ephemeral
-     corrections *and* proposes persistent rules for the memory bank via
-     dual multi-head cross-attention over its history buffer; exposes the
-     ephemeral correction vector.
+     corrections *and* proposes persistent rules for the memory bank via a
+     three-stage cross-attention pipeline (history, decision, synthesis)
+     over its history buffer; exposes the ephemeral correction vector.
    - :class:`~fusion_model.guess.GuessComponent` — self-attention predictor;
      exposes the pooled self-attention output.
-6. **Rule commitment** — if the RuleGenerator's proposal confidence exceeds
-   a learnable threshold, the proposed rule is written into the
-   lowest-utility slot of the memory bank.
+6. **Rule commitment** — the RuleGenerator's proposal includes a learned
+   **soft commit weight** derived from cosine similarity between the
+   proposed key and ``h``.  The proposed rule is soft-blended into the
+   lowest-utility memory slot using this weight, preserving existing slot
+   content proportionally rather than hard-overwriting.
 7. **DecisionRouter** — uses **cross-attention** to produce softmax mixture
    weights ``alpha`` over the three pathways.  The shared embedding ``h``
    serves as the query, and each pathway's intermediate representation
@@ -202,23 +204,25 @@ class FusionModel(nn.Module):
             alpha[:, 0:1] * logits_mem + alpha[:, 1:2] * logits_rule + alpha[:, 2:3] * logits_guess
         )
 
-        # ── Rule commitment ──────────────────────────────────────────────
+        # ── Rule commitment (soft blend) ────────────────────────────────
         committed = False
+        commit_weight_used = 0.0
         if self.training and proposal is not None:
-            prop_conf = proposal["confidence"]  # (batch, 1)
-            threshold = proposal["commit_threshold"]  # scalar
-            best_idx = int(prop_conf.argmax(dim=0).item())
-            best_conf = prop_conf[best_idx, 0]
+            weights = proposal["commit_weight"]  # (batch, 1)
+            best_idx = int(weights.argmax(dim=0).item())
+            w = weights[best_idx, 0].item()
 
-            if best_conf.item() > threshold.item():
+            if w > 1e-3:
                 slot = self.memory.get_lowest_utility_slot()
                 self.memory.commit_rule(
                     slot,
                     proposal["key"][best_idx],
                     proposal["A"][best_idx],
                     proposal["B"][best_idx],
+                    commit_weight=w,
                 )
                 committed = True
+                commit_weight_used = w
 
         # ── Update history buffer with current predictions ───────────────
         if self.training:
@@ -233,5 +237,6 @@ class FusionModel(nn.Module):
             "rule_confidence": confidence,
             "proposal": proposal,
             "committed": committed,
+            "commit_weight": commit_weight_used,
         }
         return logits, alpha, metadata

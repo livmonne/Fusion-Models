@@ -22,11 +22,11 @@ different failure mode of the mixture-of-experts architecture:
    logits.  This ensures that every pathway receives gradient signal even
    when the router assigns it near-zero weight, preventing "dead" pathways.
 
-6. **Commitment regularisation** — penalises the deviation of the soft
-   commitment rate (from the RuleGenerator's proposal confidence vs. its
-   learnable threshold) from a target rate.  This provides gradient signal
-   to both the proposer's confidence head and the ``commit_threshold_logit``
-   parameter, preventing the model from committing too aggressively or
+6. **Commitment regularisation** — penalises the deviation of the mean
+   soft commit weight (from the RuleGenerator's proposal) from a target
+   rate.  This provides gradient signal to the proposer's key projection,
+   the ``commit_threshold_logit``, and the ``commit_temperature``
+   parameters, preventing the model from committing too aggressively or
    never committing at all.
 
 All penalty weights (``lambda_*``) are hyperparameters that may need tuning
@@ -49,8 +49,8 @@ class FusionLoss(nn.Module):
     :param lambda_entropy: Weight for the (negative) routing-entropy bonus.
     :param lambda_aux: Weight for the auxiliary per-pathway losses.
     :param lambda_commit: Weight for commitment-rate regularisation.
-    :param commit_target_rate: Desired fraction of batch elements whose
-        proposal confidence exceeds the learnable threshold (soft target).
+    :param commit_target_rate: Desired mean commit weight across the batch
+        (soft target).
     """
 
     def __init__(
@@ -115,18 +115,15 @@ class FusionLoss(nn.Module):
             aux_loss = aux_loss / 3.0
 
         # -- 6. Commitment rate regularisation. --
-        # Nudges the soft commitment rate toward a target so the proposer
-        # and the learnable threshold receive gradient signal.
+        # Nudges the mean commit weight toward a target so the proposer's
+        # key projection, threshold, and temperature receive gradient signal.
         commit_reg = torch.tensor(0.0, device=logits.device)
         if metadata is not None:
             proposal = metadata.get("proposal")
             if proposal is not None:
-                prop_conf = proposal["confidence"]  # (batch, 1)
-                threshold = proposal["commit_threshold"]  # scalar
-                tau = 10.0
-                soft_commit = torch.sigmoid(tau * (prop_conf.squeeze(-1) - threshold))
-                commit_rate = soft_commit.mean()
-                commit_reg = (commit_rate - self.commit_target_rate) ** 2
+                commit_weight = proposal["commit_weight"]  # (batch, 1)
+                mean_weight = commit_weight.squeeze(-1).mean()
+                commit_reg = (mean_weight - self.commit_target_rate) ** 2
 
         # -- Combine everything. --
         total_loss: torch.Tensor = (

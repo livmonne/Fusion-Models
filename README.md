@@ -53,8 +53,8 @@ Image (3×224×224)                  Question ("How many red cubes …")
 
 | Component | Role |
 |---|---|
-| **RuleMemory** | Bank of 128 learned low-rank rules with trigger embeddings. Differentiable soft-attention retrieval. Exposes blended correction vector for routing. |
-| **RuleGenerator** | Proposes ephemeral one-shot rules as low-rank corrections per input. Uses dual multi-head cross-attention over a circular history buffer to attend separately over past embeddings and past decisions when proposing persistent rules. Exposes correction vector for routing. |
+| **RuleMemory** | Bank of 128 learned low-rank rules with trigger embeddings. Differentiable soft-attention retrieval. Supports soft-blend commitment of proposed rules. Exposes blended correction vector for routing. |
+| **RuleGenerator** | Proposes ephemeral one-shot rules as low-rank corrections per input. Uses a three-stage cross-attention pipeline (history, decision, synthesis) over a circular history buffer to propose persistent rules with a learned soft commit weight. Exposes correction vector for routing. |
 | **GuessComponent** | Self-attention over pseudo-tokens followed by an MLP head for fuzzy patterns. Exposes pooled representation for routing. |
 | **DecisionRouter** | Cross-attention router: uses ``h`` as query and each pathway's intermediate representation as keys to produce input-dependent mixture weights. |
 
