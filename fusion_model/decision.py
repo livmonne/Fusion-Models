@@ -11,9 +11,22 @@ router to evaluate the pathways along multiple independent criteria
 simultaneously — e.g. one head might focus on semantic relevance while
 another tracks confidence signals.  The multi-head attention produces a
 context vector that is a rich, value-weighted blend of the pathway
-representations, which is then projected to three routing logits:
+representations.
 
-    ``alpha = softmax(W_alpha · context / temperature)``
+A **residual connection** adds the original shared embedding ``h`` back
+to the attention context, followed by **LayerNorm**, ensuring that the
+routing MLP always has direct access to the raw input alongside the
+pathway-informed context.  This mirrors standard transformer practice
+and provides a clean gradient path from the routing decision back to
+the upstream encoders.
+
+The normalised residual is then mapped to three routing logits via a
+**two-layer MLP** (Linear → GELU → Linear) rather than a single linear
+projection, giving the router capacity to learn nonlinear feature
+interactions (e.g. "memory confidence is high *and* the question is
+about counting"):
+
+    ``alpha = softmax(MLP(LayerNorm(context + h)) / temperature)``
 
 so that the final prediction is a soft mixture:
 
@@ -50,8 +63,15 @@ class DecisionRouter(nn.Module):
     ``nn.MultiheadAttention`` computes scaled-dot-product attention across
     ``num_heads`` independent subspaces, producing a context vector that
     captures *what* information the router extracted from the pathways —
-    not just *which* pathway was most similar.  A final linear projection
-    maps this context to three routing logits.
+    not just *which* pathway was most similar.
+
+    A **residual connection** from ``h`` is added to the attention context
+    and normalised via LayerNorm, so the downstream MLP always sees both
+    the raw shared embedding and the pathway-informed context.  The
+    normalised vector is then projected to three routing logits through a
+    two-layer MLP (Linear → GELU → Linear), enabling the router to learn
+    nonlinear feature interactions that a single linear layer cannot
+    capture.
 
     :param embed_dim: Dimensionality of the shared input embedding and of
         each pathway's intermediate representation.
@@ -70,7 +90,12 @@ class DecisionRouter(nn.Module):
         self.mha = nn.MultiheadAttention(
             embed_dim, num_heads, batch_first=True,
         )
-        self.alpha_proj = nn.Linear(embed_dim, 3)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.alpha_mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, 3),
+        )
         self.temperature = nn.Parameter(torch.tensor(1.0))
 
     def forward(
@@ -83,7 +108,7 @@ class DecisionRouter(nn.Module):
         """Compute routing weights via multi-head cross-attention.
 
         :param h: Shared embedding ``(batch, embed_dim)`` — used as the
-            attention query.
+            attention query and as the residual.
         :param mem_repr: Memory pathway intermediate representation
             ``(batch, embed_dim)`` — the blended correction vector from
             :class:`~fusion_model.memory.RuleMemory`.
@@ -111,9 +136,11 @@ class DecisionRouter(nn.Module):
             average_attn_weights=False,
         )  # context: (batch, 1, embed_dim), attn_weights: (batch, num_heads, 1, 3)
 
+        fused = self.norm(context.squeeze(1) + h)  # (batch, embed_dim)
+
         temp = self.temperature.clamp(min=0.01)
         alpha: torch.Tensor = F.softmax(
-            self.alpha_proj(context.squeeze(1)) / temp,
+            self.alpha_mlp(fused) / temp,
             dim=-1,
         )  # (batch, 3)
 

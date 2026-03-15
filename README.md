@@ -47,7 +47,12 @@ Image (3×224×224)                  Question ("How many red cubes …")
        │  ┌───────────┴───────────┐
        │  │  MHA context (256)    │  per-head attn weights
        │  │       │               │  (batch, 4, 3) — logged
-       │  │  alpha_proj (256→3)   │
+       │  │       + h (residual)  │
+       │  │       │               │
+       │  │  LayerNorm (256)      │
+       │  │       │               │
+       │  │  MLP (256→256→3)      │
+       │  │  Linear→GELU→Linear   │
        │  │       │               │
        │  │  softmax / τ          │
        │  └───────┴───────────────┘
@@ -64,7 +69,7 @@ Image (3×224×224)                  Question ("How many red cubes …")
 | **RuleMemory** | Bank of 128 learned low-rank rules with trigger embeddings. Differentiable soft-attention retrieval **gated by memory strength** (frequency × recency). Learnable decay/reinforcement rates and recency half-life. Automatic pruning of forgotten slots. Supports soft-blend commitment of proposed rules. Exposes blended correction vector for routing. |
 | **RuleGenerator** | Proposes ephemeral one-shot rules as low-rank corrections per input. Uses a three-stage cross-attention pipeline (history, decision, synthesis) over a circular history buffer to propose persistent rules with a learned soft commit weight. Exposes correction vector for routing. |
 | **GuessComponent** | Self-attention over pseudo-tokens followed by an MLP head for fuzzy patterns. Exposes pooled representation for routing. |
-| **DecisionRouter** | Multi-head cross-attention router (4 heads): uses ``h`` as query and each pathway's intermediate representation as keys *and* values.  The multi-head attention produces a context vector — a value-weighted blend of the pathway representations — which is projected to three routing logits.  Per-head attention weights are returned for interpretability. |
+| **DecisionRouter** | Multi-head cross-attention router (4 heads): uses ``h`` as query and each pathway's intermediate representation as keys *and* values.  A residual connection adds ``h`` back to the attention context, followed by LayerNorm, so the routing MLP always sees both the raw input and the pathway-informed context.  A two-layer MLP (Linear → GELU → Linear) maps the normalised vector to three routing logits, enabling nonlinear feature interactions.  Per-head attention weights are returned for interpretability. |
 
 ### Memory Strength (Biologically-Inspired Decay & Reinforcement)
 
@@ -135,10 +140,20 @@ context vector before the final routing decision.
    subspaces.  This produces a context vector of shape `(batch, embed_dim)`
    that encodes *what information* the router extracted from the pathways.
 
-2. **Projection** — a linear layer maps the context vector to 3 logits
-   (one per pathway).
+2. **Residual connection + LayerNorm** — the original shared embedding `h`
+   is added back to the attention context and the sum is normalised:
+   `fused = LayerNorm(context + h)`.  This ensures the routing MLP always
+   has direct access to the raw input alongside the pathway-informed
+   context, and provides a clean gradient path back to the upstream
+   encoders without bottlenecking through the attention softmax.
 
-3. **Temperature-scaled softmax** — the logits are divided by a learnable
+3. **Two-layer MLP** — a Linear → GELU → Linear network maps the
+   normalised vector to 3 logits (one per pathway).  The hidden nonlinearity
+   lets the router learn feature interactions that a single linear projection
+   cannot capture (e.g. "memory confidence is high *and* the question is
+   about counting").
+
+4. **Temperature-scaled softmax** — the logits are divided by a learnable
    temperature `τ` and passed through softmax to produce the final routing
    coefficients `α ∈ [0, 1]³` that sum to 1.
 

@@ -43,11 +43,14 @@ distribution over a fixed set of answers.
    default) to produce softmax mixture weights ``alpha`` over the three
    pathways.  The shared embedding ``h`` serves as the query, and each
    pathway's intermediate representation serves as both key and value.
-   Each head evaluates the pathways in its own subspace, and the
-   multi-head attention produces a context vector — a value-weighted
-   blend of the pathway representations — which is then projected to
-   three routing logits.  The raw per-head attention weights are also
-   returned for interpretability.
+   Each head evaluates the pathways in its own subspace, producing a
+   context vector — a value-weighted blend of the pathway
+   representations.  A **residual connection** adds ``h`` back to the
+   context, followed by **LayerNorm**, ensuring the routing MLP always
+   has direct access to the raw input.  The normalised vector is then
+   mapped to three routing logits via a **two-layer MLP**
+   (Linear → GELU → Linear).  The raw per-head attention weights are
+   also returned for interpretability.
 8. **History update** — the current ``(h, prediction)`` pair is appended to
    the RuleGenerator's circular history buffer (training only).
 9. **Output** — the final logits are the weighted sum of the pathway logits.
