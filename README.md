@@ -39,11 +39,19 @@ Image (3×224×224)                  Question ("How many red cubes …")
        │              │              │
        ▼              ▼              ▼
        ┌──────────────┼──────────────┐
-       │    DecisionRouter (cross-attention)
-       │    query = h
-       │    keys  = [mem_repr, rule_repr, guess_repr]
+       │  DecisionRouter (multi-head cross-attention, 4 heads)
+       │  query  = h
+       │  keys   = [mem_repr, rule_repr, guess_repr]
+       │  values = [mem_repr, rule_repr, guess_repr]
        │              │
-       │       α = attn weights (3)
+       │  ┌───────────┴───────────┐
+       │  │  MHA context (256)    │  per-head attn weights
+       │  │       │               │  (batch, 4, 3) — logged
+       │  │  alpha_proj (256→3)   │
+       │  │       │               │
+       │  │  softmax / τ          │
+       │  └───────┴───────────────┘
+       │       α (batch, 3)
        └──────────────┘
                       │
      p(y|x) = α_mem·p_mem + α_rule·p_rule + α_guess·p_guess
@@ -56,7 +64,7 @@ Image (3×224×224)                  Question ("How many red cubes …")
 | **RuleMemory** | Bank of 128 learned low-rank rules with trigger embeddings. Differentiable soft-attention retrieval **gated by memory strength** (frequency × recency). Learnable decay/reinforcement rates and recency half-life. Automatic pruning of forgotten slots. Supports soft-blend commitment of proposed rules. Exposes blended correction vector for routing. |
 | **RuleGenerator** | Proposes ephemeral one-shot rules as low-rank corrections per input. Uses a three-stage cross-attention pipeline (history, decision, synthesis) over a circular history buffer to propose persistent rules with a learned soft commit weight. Exposes correction vector for routing. |
 | **GuessComponent** | Self-attention over pseudo-tokens followed by an MLP head for fuzzy patterns. Exposes pooled representation for routing. |
-| **DecisionRouter** | Cross-attention router: uses ``h`` as query and each pathway's intermediate representation as keys to produce input-dependent mixture weights. |
+| **DecisionRouter** | Multi-head cross-attention router (4 heads): uses ``h`` as query and each pathway's intermediate representation as keys *and* values.  The multi-head attention produces a context vector — a value-weighted blend of the pathway representations — which is projected to three routing logits.  Per-head attention weights are returned for interpretability. |
 
 ### Memory Strength (Biologically-Inspired Decay & Reinforcement)
 
@@ -81,6 +89,133 @@ or total saturation).
 Slots whose strength drops below a configurable threshold are **pruned**:
 their parameters are re-initialised with small random values and given a
 moderate starting frequency, recycling capacity for new rules.
+
+### Decision Router (Multi-Head Cross-Attention Routing)
+
+The DecisionRouter determines how much each expert pathway contributes to
+the final answer.  It does this via **multi-head cross-attention** over the
+three pathway representations, followed by a learned projection.
+
+#### Why cross-attention instead of an MLP?
+
+A naive approach would concatenate the three pathway representations into a
+flat vector and pass it through an MLP to produce three mixture weights.
+This works, but the MLP sees a fixed-size input regardless of what the
+pathways are "saying" — it can only learn static feature-position mappings.
+
+Cross-attention is fundamentally different: the shared embedding `h` acts
+as a **query** that *asks* each pathway "what can you offer for this
+input?"  Each pathway's representation acts as a **key** (controlling when
+it attracts attention) and a **value** (controlling what information it
+communicates).  This means the routing decision is **input-dependent** by
+construction — the same pathway can be upweighted or downweighted depending
+on the specific image-question pair.
+
+#### Why multiple heads?
+
+With a single attention head, the router can only evaluate the pathways
+along one learned comparison axis (e.g. "which pathway's key is most
+similar to my query?").  With multiple heads, each head operates in its own
+**subspace** and can learn a different evaluation criterion:
+
+- One head might focus on **semantic relevance** — which pathway's
+  representation aligns best with the current input.
+- Another might track **confidence signals** — detecting when a pathway's
+  value representation indicates high certainty.
+- A third might evaluate **complementarity** — identifying when pathways
+  are saying contradictory things and a tiebreaker is needed.
+
+The multi-head attention combines these perspectives into a single rich
+context vector before the final routing decision.
+
+#### How routing weights are produced
+
+1. **Multi-head attention** — `h` queries over the 3 pathway tokens
+   (key = value = pathway representations) across `num_heads` independent
+   subspaces.  This produces a context vector of shape `(batch, embed_dim)`
+   that encodes *what information* the router extracted from the pathways.
+
+2. **Projection** — a linear layer maps the context vector to 3 logits
+   (one per pathway).
+
+3. **Temperature-scaled softmax** — the logits are divided by a learnable
+   temperature `τ` and passed through softmax to produce the final routing
+   coefficients `α ∈ [0, 1]³` that sum to 1.
+
+The key insight is that the routing decision passes through the **value
+projections**, not just the attention weights.  Each pathway's key controls
+*when* it attracts attention, but its value controls *what it communicates*
+to the routing decision.  This separation lets the router make decisions
+based on richer information than dot-product similarity alone.
+
+#### Interpretability
+
+The router returns two outputs:
+
+| Output | Shape | Description |
+|---|---|---|
+| `alpha` | `(batch, 3)` | Final routing coefficients used for the mixture. |
+| `attn_weights` | `(batch, num_heads, 3)` | Raw per-head attention distributions over the three pathways. |
+
+The per-head attention weights reveal *how* each head is evaluating the
+pathways — even though they are not directly used as routing coefficients,
+they show which pathways each head considers relevant.  Comparing
+`attn_weights` against `alpha` can reveal how the value projections and
+`alpha_proj` layer transform raw attention into final routing decisions.
+
+### How the Pieces Fit Together
+
+The architecture follows a **perceive → specialise → arbitrate** pipeline:
+
+1. **Perceive** — the image encoder and question encoder independently
+   process their respective modalities.  Multi-head spatial attention lets
+   the question "look at" different image regions (e.g. the subject vs. a
+   reference object), producing a single attended image vector.
+
+2. **Fuse** — the attended image vector and question embedding are combined
+   via element-wise product (capturing multiplicative interactions) followed
+   by a linear projection.  A residual connection from the question
+   embedding ensures that raw linguistic signal is always available
+   downstream, even if the multiplicative fusion loses it.
+
+3. **Specialise** — three expert pathways process the fused embedding `h`
+   independently.  Each pathway is designed for a different reasoning
+   strategy:
+   - **RuleMemory** retrieves and applies stored rules — good for
+     recurring patterns the model has seen before.
+   - **RuleGenerator** synthesises one-shot rules on the fly — good for
+     novel situations that require compositional reasoning.
+   - **GuessComponent** uses self-attention over learned pseudo-tokens —
+     a flexible fallback for fuzzy pattern matching.
+
+4. **Arbitrate** — the DecisionRouter uses multi-head cross-attention to
+   decide how much to trust each pathway for the current input.  The final
+   prediction is a soft mixture weighted by the routing coefficients.
+
+5. **Consolidate** — during training, the RuleGenerator can propose new
+   rules for permanent storage in the RuleMemory.  A learned commit weight
+   controls how aggressively new rules overwrite weak memory slots,
+   creating a feedback loop where successful ephemeral rules graduate into
+   long-term memory.
+
+### Loss Function
+
+The training objective balances seven terms:
+
+| Term | Purpose | Effect |
+|---|---|---|
+| **Task loss** | Cross-entropy on the blended output | Main learning signal |
+| **Guess penalty** | Penalises `mean(α_guess)` | Prevents over-reliance on the guess fallback |
+| **Storage cost** | Approximate L0 over slot usage | Encourages sparse, specialised memory slots |
+| **Entropy bonus** | Maximises `H(α)` | Prevents routing collapse early in training |
+| **Auxiliary losses** | Cross-entropy on each pathway's own logits | Keeps all pathways learning even when the router ignores them |
+| **Commitment reg.** | Penalises deviation from target commit rate | Prevents the rule proposer from committing too aggressively or never |
+| **Strength reg.** | Penalises deviation from target mean strength | Prevents total amnesia or total saturation of memory slots |
+
+The entropy bonus and guess penalty work in tension: entropy encourages
+uniform routing (explore all pathways), while the guess penalty discourages
+one specific pathway.  Together they push the router toward a balanced
+exploration of the rule-based pathways.
 
 ## Quick Start
 

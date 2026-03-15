@@ -180,15 +180,15 @@ class RuleMemory(nn.Module):
         freq_score = self.frequency.clamp(0.0, 1.0)
 
         half_life = self.recency_halflife_log.exp().clamp(min=1.0)
-        recency_score = torch.exp(
-            -math.log(2.0) * self.steps_since_activation / half_life
-        )
+        recency_score = torch.exp(-math.log(2.0) * self.steps_since_activation / half_life)
 
         return freq_score * recency_score
 
     # ── Forward pass ──────────────────────────────────────────────────────
 
-    def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    def forward(
+        self, h: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Retrieve relevant rules and produce memory-pathway logits.
 
         Retrieval scores are **gated by memory strength** so that weak
@@ -285,15 +285,6 @@ class RuleMemory(nn.Module):
         # the least useful one.
         combined = strength + 1e-6 * self.utility
         return int(combined.argmin().item())
-
-    def get_lowest_utility_slot(self) -> int:
-        """Return the index of the rule slot with the lowest utility score.
-
-        .. deprecated::
-            Prefer :meth:`get_weakest_slot` which accounts for both
-            frequency and recency via the strength mechanism.
-        """
-        return int(self.utility.argmin().item())
 
     # ── Rule commitment ──────────────────────────────────────────────────
 

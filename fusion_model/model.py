@@ -39,11 +39,15 @@ distribution over a fixed set of answers.
    preserving existing slot content proportionally rather than
    hard-overwriting.  The committed slot's strength signals are reset so
    it starts with a fair chance of survival.
-7. **DecisionRouter** — uses **cross-attention** to produce softmax mixture
-   weights ``alpha`` over the three pathways.  The shared embedding ``h``
-   serves as the query, and each pathway's intermediate representation
-   serves as a key, so the router can dynamically compare what the model
-   needs against what each expert offers.
+7. **DecisionRouter** — uses **multi-head cross-attention** (4 heads by
+   default) to produce softmax mixture weights ``alpha`` over the three
+   pathways.  The shared embedding ``h`` serves as the query, and each
+   pathway's intermediate representation serves as both key and value.
+   Each head evaluates the pathways in its own subspace, and the
+   multi-head attention produces a context vector — a value-weighted
+   blend of the pathway representations — which is then projected to
+   three routing logits.  The raw per-head attention weights are also
+   returned for interpretability.
 8. **History update** — the current ``(h, prediction)`` pair is appended to
    the RuleGenerator's circular history buffer (training only).
 9. **Output** — the final logits are the weighted sum of the pathway logits.
@@ -200,7 +204,7 @@ class FusionModel(nn.Module):
         logits_guess, guess_repr = self.guess(h)
 
         # ── Route and blend ──────────────────────────────────────────────
-        alpha = self.router(h, mem_repr, rule_repr, guess_repr)
+        alpha, router_attn = self.router(h, mem_repr, rule_repr, guess_repr)
 
         # Weighted mixture: each alpha slice is (batch, 1) for broadcasting.
         logits = (
@@ -239,6 +243,7 @@ class FusionModel(nn.Module):
             "retrieval_scores": retrieval_info["scores"],
             "memory_strength": retrieval_info["strength"],
             "rule_confidence": confidence,
+            "router_attn": router_attn,
             "proposal": proposal,
             "committed": committed,
             "commit_weight": commit_weight_used,

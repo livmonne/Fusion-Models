@@ -199,10 +199,34 @@ class TestDecisionRouter:
         mem_repr = torch.randn(BATCH, EMBED)
         rule_repr = torch.randn(BATCH, EMBED)
         guess_repr = torch.randn(BATCH, EMBED)
-        alpha = router(h, mem_repr, rule_repr, guess_repr)
+        alpha, attn_weights = router(h, mem_repr, rule_repr, guess_repr)
 
         assert alpha.shape == (BATCH, 3)
         assert torch.allclose(alpha.sum(dim=-1), torch.ones(BATCH), atol=1e-5)
+
+    def test_attn_weights_shape(self) -> None:
+        """Per-head attention weights must have shape (batch, num_heads, 3)."""
+        num_heads = 4
+        router = DecisionRouter(embed_dim=EMBED, num_heads=num_heads)
+        h = torch.randn(BATCH, EMBED)
+        mem_repr = torch.randn(BATCH, EMBED)
+        rule_repr = torch.randn(BATCH, EMBED)
+        guess_repr = torch.randn(BATCH, EMBED)
+        _alpha, attn_weights = router(h, mem_repr, rule_repr, guess_repr)
+
+        assert attn_weights.shape == (BATCH, num_heads, 3)
+        sums = attn_weights.sum(dim=-1)
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+
+    def test_num_heads_configurable(self) -> None:
+        """Router must work with different head counts."""
+        for n_heads in (1, 2, 4):
+            router = DecisionRouter(embed_dim=EMBED, num_heads=n_heads)
+            h = torch.randn(BATCH, EMBED)
+            reprs = [torch.randn(BATCH, EMBED) for _ in range(3)]
+            alpha, attn = router(h, *reprs)
+            assert alpha.shape == (BATCH, 3)
+            assert attn.shape == (BATCH, n_heads, 3)
 
 
 class TestFusionLoss:
