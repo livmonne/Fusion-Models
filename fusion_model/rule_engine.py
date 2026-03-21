@@ -8,26 +8,29 @@
    only.
 
 2. **Rule proposal** — the generator maintains a circular history buffer of
-   recent ``(h, prediction)`` pairs.  The proposal pipeline has three stages
-   of cross-attention:
+   recent ``(h, decision, outcome)`` triples.  The proposal pipeline has
+   three stages of cross-attention that operate *entirely on history* — the
+   current input is deliberately excluded so that proposed rules reflect
+   what actually worked rather than what the model is currently looking at:
 
-   a. **History cross-attention** — ``h`` queries over past embeddings to
-      extract relevant historical context.
-   b. **Decision cross-attention** — ``h`` queries over past decision
-      embeddings (projected to ``embed_dim``) to extract relevant decision
-      context.
-   c. **Synthesis cross-attention** — ``h`` queries over the three-token
-      sequence ``[h, attended_h, attended_dec]`` to dynamically weight
-      which context source matters most for the current proposal, producing
-      a single ``embed_dim`` vector that is projected to the proposed rule
-      parameters ``(key, A, B)``.
+   a. **Input→Decision cross-attention** — historical input embeddings
+      query over historical decision embeddings (projected to
+      ``embed_dim``) to discover which inputs led to which decisions.
+   b. **Outcome cross-attention** — the input→decision attended result
+      queries over historical outcome embeddings (a learned projection
+      of the scalar loss signal) to identify which input→decision
+      pairings produced good or bad outcomes.
+   c. **Synthesis cross-attention** — a learned query token attends over
+      the two attended representations ``[attended_input_dec,
+      attended_outcome]`` to dynamically weight the two context sources,
+      producing a single ``embed_dim`` vector that is projected to the
+      proposed rule parameters ``(key, A, B)``.
 
    The proposal also outputs a **soft commit weight** computed as
    ``sigmoid((similarity - threshold) * temperature)`` where *similarity*
-   is the cosine similarity between the proposed key and ``h``,
-   *threshold* is a learnable scalar, and *temperature* controls
-   sharpness.  This allows partial blending of the proposed rule into
-   the target memory slot rather than a hard overwrite.
+   is the cosine similarity between the proposed key and the mean
+   historical embedding, *threshold* is a learnable scalar, and
+   *temperature* controls sharpness.
 
 This two-tier design lets the model invent hypotheses on the fly *and*
 distill recurring patterns into the long-term rule bank.
@@ -42,31 +45,33 @@ import torch.nn as nn
 class RuleGenerator(nn.Module):
     """Generate ephemeral low-rank corrections and propose persistent rules.
 
-    The rule proposer uses a **three-stage cross-attention** pipeline over
-    the circular history buffer:
+    The rule proposer uses a **three-stage cross-attention** pipeline that
+    operates entirely on the history buffer — no current-input dependency:
 
-    1. History cross-attention reads out past embeddings.
-    2. Decision cross-attention reads out past decision embeddings
-       (projected to ``embed_dim``).
-    3. Synthesis cross-attention attends over the three-token sequence
-       ``[h, attended_h, attended_dec]`` using ``h`` as the query,
-       dynamically weighting which context source is most relevant for
-       the current proposal.
+    1. Historical inputs cross-attend over historical decisions to learn
+       which inputs led to which decisions.
+    2. That result cross-attends over historical outcome signals to learn
+       which input→decision pairings were effective.
+    3. A learned synthesis query attends over the two attended
+       representations to produce the final rule proposal.
 
     The proposal includes a **soft commit weight** derived from the cosine
-    similarity between the proposed key and ``h``, a learnable threshold,
-    and a learnable temperature, enabling partial blending into the target
-    memory slot.
+    similarity between the proposed key and the mean historical embedding,
+    a learnable threshold, and a learnable temperature, enabling partial
+    blending into the target memory slot.
 
     :param embed_dim: Dimensionality of the shared input embedding.
     :param num_classes: Number of output classes.
     :param rank: Inner rank of the generated low-rank matrices.
     :param hidden_dim: Width of the internal MLP.
-    :param history_size: Capacity of the circular ``(h, decision)`` buffer.
+    :param history_size: Capacity of the circular ``(h, decision, outcome)``
+        buffer.
     :param min_history: Minimum entries in the buffer before rule proposal
         is attempted.
     :param decision_embed_dim: Embedding dimension for stored decision
         indices before projection to ``embed_dim``.
+    :param outcome_proj_dim: Hidden dimension for projecting scalar outcome
+        signals to ``embed_dim``.
     """
 
     def __init__(
@@ -78,6 +83,7 @@ class RuleGenerator(nn.Module):
         history_size: int = 512,
         min_history: int = 64,
         decision_embed_dim: int = 32,
+        outcome_proj_dim: int = 64,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -99,26 +105,34 @@ class RuleGenerator(nn.Module):
 
         # ── History buffer (non-gradient circular buffer) ────────────────
         self.register_buffer("history_h", torch.zeros(history_size, embed_dim))
-        self.register_buffer("history_decisions", torch.full((history_size,), -1, dtype=torch.long))
+        self.register_buffer(
+            "history_decisions", torch.full((history_size,), -1, dtype=torch.long),
+        )
+        self.register_buffer("history_outcomes", torch.zeros(history_size))
         self.register_buffer("history_ptr", torch.tensor(0, dtype=torch.long))
         self.register_buffer("history_count", torch.tensor(0, dtype=torch.long))
 
         # ── Rule proposer ────────────────────────────────────────────────
         self.decision_embed = nn.Embedding(num_classes, decision_embed_dim)
 
-        # Cross-attention over history embeddings: query = h, key/value = valid_h.
-        self.history_cross_attn = nn.MultiheadAttention(
+        # Stage 1: historical inputs query over historical decisions.
+        self.input_dec_cross_attn = nn.MultiheadAttention(
             embed_dim, num_heads=4, batch_first=True,
         )
-        # Cross-attention over decision embeddings: query = h, key/value = dec_emb
-        # projected to embed_dim so the attention heads have full width.
         self.dec_proj = nn.Linear(decision_embed_dim, embed_dim)
-        self.dec_cross_attn = nn.MultiheadAttention(
+
+        # Stage 2: input→decision result queries over outcome embeddings.
+        self.outcome_proj = nn.Sequential(
+            nn.Linear(1, outcome_proj_dim),
+            nn.GELU(),
+            nn.Linear(outcome_proj_dim, embed_dim),
+        )
+        self.outcome_cross_attn = nn.MultiheadAttention(
             embed_dim, num_heads=4, batch_first=True,
         )
 
-        # Synthesis cross-attention: query = h, keys/values = [h, attended_h, attended_dec].
-        # Dynamically weights which context source matters most per input.
+        # Stage 3: learned synthesis query attends over the two attended results.
+        self.synthesis_query = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
         self.synthesis_cross_attn = nn.MultiheadAttention(
             embed_dim, num_heads=4, batch_first=True,
         )
@@ -135,15 +149,23 @@ class RuleGenerator(nn.Module):
     # ── History management ───────────────────────────────────────────────
 
     @torch.no_grad()
-    def update_history(self, h: torch.Tensor, decisions: torch.Tensor) -> None:
-        """Append a batch of ``(h, decision)`` pairs to the circular buffer.
+    def update_history(
+        self,
+        h: torch.Tensor,
+        decisions: torch.Tensor,
+        outcomes: torch.Tensor,
+    ) -> None:
+        """Append a batch of ``(h, decision, outcome)`` triples to the buffer.
 
         :param h: Shared embeddings ``(batch, embed_dim)`` — will be detached.
         :param decisions: Predicted class indices ``(batch,)``.
+        :param outcomes: Per-sample outcome signal ``(batch,)`` — typically
+            the per-sample loss (lower = better).
         """
         batch = h.shape[0]
         h_det = h.detach()
         dec_det = decisions.detach()
+        out_det = outcomes.detach()
 
         ptr = self.history_ptr.item()
         end = ptr + batch
@@ -151,38 +173,44 @@ class RuleGenerator(nn.Module):
         if end <= self.history_size:
             self.history_h[ptr:end] = h_det
             self.history_decisions[ptr:end] = dec_det
+            self.history_outcomes[ptr:end] = out_det
         else:
             first = self.history_size - ptr
             self.history_h[ptr:] = h_det[:first]
             self.history_decisions[ptr:] = dec_det[:first]
+            self.history_outcomes[ptr:] = out_det[:first]
             self.history_h[: end - self.history_size] = h_det[first:]
             self.history_decisions[: end - self.history_size] = dec_det[first:]
+            self.history_outcomes[: end - self.history_size] = out_det[first:]
 
         self.history_ptr.fill_(end % self.history_size)
-        self.history_count.fill_(min(self.history_count.item() + batch, self.history_size))
+        self.history_count.fill_(
+            min(self.history_count.item() + batch, self.history_size),
+        )
 
     # ── Rule proposal ────────────────────────────────────────────────────
 
-    def propose_rule(self, h: torch.Tensor) -> dict[str, torch.Tensor] | None:
-        """Propose a persistent rule from current input + history context.
+    def propose_rule(self, batch_size: int) -> dict[str, torch.Tensor] | None:
+        """Propose a persistent rule from historical context only.
 
-        Three-stage cross-attention pipeline:
+        Three-stage cross-attention pipeline operating on history:
 
-        1. ``h`` queries over past embeddings (history cross-attention).
-        2. ``h`` queries over past decision embeddings (decision cross-attention).
-        3. ``h`` queries over the three-token sequence
-           ``[h, attended_h, attended_dec]`` (synthesis cross-attention),
-           dynamically weighting which context source is most relevant.
+        1. Historical input embeddings query over historical decision
+           embeddings — learning which inputs led to which decisions.
+        2. The input→decision attended result queries over historical
+           outcome embeddings — learning which pairings were effective.
+        3. A learned synthesis query attends over the two attended
+           representations to produce the final rule parameters.
 
-        The synthesis output is projected to the proposed rule parameters
-        ``(key, A, B)``.  A **soft commit weight** is computed from the
-        cosine similarity between the proposed key and ``h``, passed through
-        ``sigmoid((similarity - threshold) * temperature)``.
+        The current input ``h`` is deliberately excluded: rules should
+        reflect what *worked* historically, not what the model is
+        currently looking at.
 
         Returns ``None`` when the history buffer has fewer than
         ``min_history`` entries.
 
-        :param h: Shared embedding ``(batch, embed_dim)``.
+        :param batch_size: Number of proposals to generate (one per batch
+            element, all derived from the same history).
         :return: Dict with ``key``, ``A``, ``B``, ``commit_weight`` (per
             batch element), or ``None``.
         """
@@ -190,48 +218,63 @@ class RuleGenerator(nn.Module):
         if count < self.min_history:
             return None
 
-        batch = h.shape[0]
-        valid_h = self.history_h[:count].clone()  # (count, embed_dim)
+        valid_h = self.history_h[:count].clone()        # (count, embed_dim)
         valid_dec = self.history_decisions[:count].clone()  # (count,)
+        valid_out = self.history_outcomes[:count].clone()   # (count,)
 
-        query = h.unsqueeze(1)  # (batch, 1, embed_dim)
+        # Expand history to batch dimension — every batch element sees the
+        # same history but the attention weights are independent.
+        hist_h = valid_h.unsqueeze(0).expand(batch_size, -1, -1)  # (B, count, E)
 
-        # Stage 1: cross-attend over history embeddings.
-        kv_h = valid_h.unsqueeze(0).expand(batch, -1, -1)  # (batch, count, embed_dim)
-        attended_h, _ = self.history_cross_attn(query, kv_h, kv_h)
-        attended_h = attended_h.squeeze(1)  # (batch, embed_dim)
+        # Stage 1: historical inputs cross-attend over historical decisions.
+        dec_emb = self.dec_proj(self.decision_embed(valid_dec))  # (count, E)
+        kv_dec = dec_emb.unsqueeze(0).expand(batch_size, -1, -1)  # (B, count, E)
+        attended_input_dec, _ = self.input_dec_cross_attn(hist_h, kv_dec, kv_dec)
+        # (B, count, E) — each historical input position now carries
+        # information about what decisions were associated with similar inputs.
 
-        # Stage 2: cross-attend over decision embeddings (projected to embed_dim).
-        dec_emb = self.dec_proj(self.decision_embed(valid_dec))  # (count, embed_dim)
-        kv_dec = dec_emb.unsqueeze(0).expand(batch, -1, -1)  # (batch, count, embed_dim)
-        attended_dec, _ = self.dec_cross_attn(query, kv_dec, kv_dec)
-        attended_dec = attended_dec.squeeze(1)  # (batch, embed_dim)
+        # Stage 2: input→decision result cross-attends over outcome embeddings.
+        outcome_emb = self.outcome_proj(valid_out.unsqueeze(-1))  # (count, E)
+        kv_out = outcome_emb.unsqueeze(0).expand(batch_size, -1, -1)  # (B, count, E)
+        attended_outcome, _ = self.outcome_cross_attn(
+            attended_input_dec, kv_out, kv_out,
+        )
+        # (B, count, E) — now carries input→decision→outcome associations.
 
-        # Stage 3: synthesis cross-attention over [h, attended_h, attended_dec].
+        # Pool the two attended sequences to single vectors.
+        attended_input_dec_pooled = attended_input_dec.mean(dim=1)  # (B, E)
+        attended_outcome_pooled = attended_outcome.mean(dim=1)      # (B, E)
+
+        # Stage 3: learned synthesis query attends over the two pooled results.
         context_tokens = torch.stack(
-            [h, attended_h, attended_dec], dim=1,
-        )  # (batch, 3, embed_dim)
-        synthesised, _ = self.synthesis_cross_attn(query, context_tokens, context_tokens)
-        synthesised = synthesised.squeeze(1)  # (batch, embed_dim)
+            [attended_input_dec_pooled, attended_outcome_pooled], dim=1,
+        )  # (B, 2, E)
+        syn_query = self.synthesis_query.expand(batch_size, -1, -1)  # (B, 1, E)
+        synthesised, _ = self.synthesis_cross_attn(
+            syn_query, context_tokens, context_tokens,
+        )
+        synthesised = synthesised.squeeze(1)  # (B, E)
 
-        raw = self.rule_proj(synthesised)  # (batch, proposer_out)
+        raw = self.rule_proj(synthesised)  # (B, proposer_out)
 
         # Unpack proposed rule parameters.
         e, r = self.embed_dim, self.rank
-        key = raw[:, :e]  # (batch, embed_dim)
+        key = raw[:, :e]                                 # (B, E)
         a_flat = raw[:, e : e + e * r]
         b_flat = raw[:, e + e * r : e + 2 * e * r]
 
-        A = a_flat.view(-1, e, r)  # (batch, embed_dim, rank)
-        B = b_flat.view(-1, r, e)  # (batch, rank, embed_dim)
+        A = a_flat.view(-1, e, r)   # (B, E, rank)
+        B = b_flat.view(-1, r, e)   # (B, rank, E)
 
-        # Soft commit weight from cosine similarity between proposed key and h.
-        similarity = nn.functional.cosine_similarity(key, h, dim=-1)  # (batch,)
+        # Soft commit weight: cosine similarity between proposed key and
+        # the mean historical embedding (since we have no current input).
+        mean_hist = valid_h.mean(dim=0, keepdim=True).expand(batch_size, -1)
+        similarity = nn.functional.cosine_similarity(key, mean_hist, dim=-1)
         threshold = torch.sigmoid(self.commit_threshold_logit)
         temperature = self.commit_temperature.clamp(min=0.01)
         commit_weight = torch.sigmoid(
             (similarity - threshold) * temperature,
-        ).unsqueeze(-1)  # (batch, 1)
+        ).unsqueeze(-1)  # (B, 1)
 
         return {
             "key": key,
@@ -272,6 +315,6 @@ class RuleGenerator(nn.Module):
 
         logits_rule = self.head(correction)
 
-        proposal = self.propose_rule(h)
+        proposal = self.propose_rule(batch)
 
         return logits_rule, confidence, correction, proposal

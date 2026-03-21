@@ -152,10 +152,10 @@ class TestRuleGenerator:
         for _ in range(min_hist // BATCH + 1):
             h_fill = torch.randn(BATCH, EMBED)
             decisions = torch.randint(0, N_CLASSES, (BATCH,))
-            gen.update_history(h_fill, decisions)
+            outcomes = torch.rand(BATCH)
+            gen.update_history(h_fill, decisions, outcomes)
 
-        h = torch.randn(BATCH, EMBED)
-        proposal = gen.propose_rule(h)
+        proposal = gen.propose_rule(BATCH)
 
         assert proposal is not None
         assert proposal["key"].shape == (BATCH, EMBED)
@@ -167,8 +167,7 @@ class TestRuleGenerator:
     def test_proposal_none_before_min_history(self) -> None:
         """propose_rule must return None when history is below min_history."""
         gen = RuleGenerator(embed_dim=EMBED, num_classes=N_CLASSES, rank=RANK, min_history=64)
-        h = torch.randn(BATCH, EMBED)
-        assert gen.propose_rule(h) is None
+        assert gen.propose_rule(BATCH) is None
 
 
 class TestGuessComponent:

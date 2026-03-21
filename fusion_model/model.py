@@ -206,6 +206,27 @@ class FusionModel(nn.Module):
         # ── Decision router ──────────────────────────────────────────────
         self.router = DecisionRouter(embed_dim=embed_dim)
 
+    # ── Deferred history update ─────────────────────────────────────────
+
+    @torch.no_grad()
+    def update_rule_history(self, outcomes: torch.Tensor) -> None:
+        """Push the pending ``(h, decision, outcome)`` triple into the
+        RuleGenerator's history buffer.
+
+        Must be called by the training loop *after* computing the per-sample
+        loss.  Does nothing if no pending history exists (e.g. during eval).
+
+        :param outcomes: Per-sample outcome signal ``(batch,)`` — typically
+            the per-sample loss (lower = better).
+        """
+        pending = getattr(self, "_pending_history", None)
+        if pending is None:
+            return
+        self.rule_gen.update_history(
+            pending["h"], pending["decisions"], outcomes,
+        )
+        self._pending_history = None
+
     # ── Helper: embed a batch of grids ────────────────────────────────────
 
     def _embed_grid(
@@ -341,13 +362,19 @@ class FusionModel(nn.Module):
                 committed = True
                 commit_weight_used = w
 
-        # ── 8. Update history buffer ─────────────────────────────────────
+        # ── 8. Stash info needed for deferred history update ─────────────
+        # The outcome signal (per-sample loss) is not available until after
+        # the loss is computed, so we stash the embedding and predictions
+        # here and expose ``update_rule_history`` for the training loop to
+        # call once the loss is known.
         if self.training:
             preds = logits_flat.detach().view(B, self.max_output_cells, self.num_colours)
-            pred_cells = preds[:, :, :].argmax(dim=-1)  # (B, max_output_cells)
-            # Use a hash of the prediction as a single "decision" index.
+            pred_cells = preds[:, :, :].argmax(dim=-1)
             pred_hash = pred_cells.sum(dim=-1) % self.rule_gen.num_classes
-            self.rule_gen.update_history(h, pred_hash)
+            self._pending_history = {
+                "h": h.detach(),
+                "decisions": pred_hash,
+            }
 
         metadata: dict[str, Any] = {
             "logits_mem": logits_mem,

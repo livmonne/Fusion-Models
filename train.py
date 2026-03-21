@@ -130,6 +130,9 @@ def train_fusion(
     history: dict[str, list[float]] = {"train_loss": [], "train_acc": [], "val_acc": []}
 
     ce = torch.nn.CrossEntropyLoss(ignore_index=PAD_VALUE)
+    ce_per_sample = torch.nn.CrossEntropyLoss(
+        ignore_index=PAD_VALUE, reduction="none",
+    )
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -159,6 +162,20 @@ def train_fusion(
                 logits.reshape(-1, model.num_colours),
                 targets_flat.reshape(-1),
             )
+
+            # Per-sample loss for the rule generator's history buffer.
+            per_cell_loss = ce_per_sample(
+                logits.reshape(-1, model.num_colours),
+                targets_flat.reshape(-1),
+            ).view(B, -1)
+            valid_mask = (targets_flat != PAD_VALUE).float()
+            per_sample_loss = (
+                (per_cell_loss * valid_mask).sum(dim=-1)
+                / valid_mask.sum(dim=-1).clamp(min=1.0)
+            ).detach()
+
+            # Feed outcome signal to the rule generator's history.
+            model.update_rule_history(per_sample_loss)
 
             # Fusion loss components (uses the flat logits for aux losses).
             fusion_loss, loss_dict = criterion(

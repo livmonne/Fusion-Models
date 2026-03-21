@@ -76,7 +76,7 @@ Demo Pairs (input/output grids)                Test Input Grid
 | **Transformer Encoder** | Processes concatenated demo input+output token sequences via self-attention, allowing the model to learn the transformation pattern within each demo pair. |
 | **Multi-Head Cross-Attention** | Test input tokens cross-attend to the demo context. Each head can focus on different aspects of the demonstrated transformation (colour mapping, spatial pattern, etc.). This is the core mechanism for transferring the inferred rule to the test input. |
 | **RuleMemory** | Bank of 128 learned low-rank rules with trigger embeddings. Differentiable soft-attention retrieval **gated by memory strength** (frequency × recency). Learnable decay/reinforcement rates and recency half-life. Automatic pruning of forgotten slots. Supports soft-blend commitment of proposed rules. Exposes blended correction vector for routing. |
-| **RuleGenerator** | Proposes ephemeral one-shot rules as low-rank corrections per input. Uses a three-stage cross-attention pipeline (history, decision, synthesis) over a circular history buffer to propose persistent rules with a learned soft commit weight. Exposes correction vector for routing. |
+| **RuleGenerator** | Proposes ephemeral one-shot rules as low-rank corrections per input. Maintains a circular history buffer of `(embedding, decision, outcome)` triples and uses a three-stage cross-attention pipeline — operating entirely on history, not the current input — to propose persistent rules: (1) historical inputs attend over historical decisions, (2) that result attends over outcome signals (per-sample loss), (3) a learned synthesis query fuses the two. Produces a soft commit weight for blending into the weakest memory slot. Exposes correction vector for routing. |
 | **GuessComponent** | Self-attention over pseudo-tokens followed by an MLP head for fuzzy patterns. Exposes pooled representation for routing. |
 | **DecisionRouter** | Multi-head cross-attention router (4 heads): uses ``h`` as query and each pathway's intermediate representation as keys *and* values.  A residual connection adds ``h`` back to the attention context, followed by LayerNorm, so the routing MLP always sees both the raw input and the pathway-informed context.  A two-layer MLP (Linear → GELU → Linear) maps the normalised vector to three routing logits, enabling nonlinear feature interactions.  Per-head attention weights are returned for interpretability. |
 
@@ -163,8 +163,11 @@ The architecture follows a **perceive → specialise → arbitrate** pipeline:
 5. **Output** — the blended logits are reshaped to per-cell colour
    predictions for the output grid.
 
-6. **Consolidate** — during training, the RuleGenerator can propose new
-   rules for permanent storage in the RuleMemory.
+6. **Consolidate** — during training, the RuleGenerator proposes new
+   rules for permanent storage in the RuleMemory.  The per-sample loss
+   is fed back into the history buffer as an outcome signal so the
+   proposer can learn which input→decision pairings were effective.
+   History update is deferred until after the loss is computed.
 
 ### Loss Function
 
