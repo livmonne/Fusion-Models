@@ -72,7 +72,7 @@ class RuleGenerator(nn.Module):
     def __init__(
         self,
         embed_dim: int = 256,
-        num_classes: int = 28,
+        num_classes: int = 9000,
         rank: int = 8,
         hidden_dim: int = 256,
         history_size: int = 512,

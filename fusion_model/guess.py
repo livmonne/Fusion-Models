@@ -2,8 +2,8 @@
 
 This is the "pattern matching" pathway.  It handles fuzzy, hard-to-formalise
 patterns that cannot be captured by crisp rules — for example, recognising
-that a question like *"Is there a large red rubber thing?"* needs holistic
-scene understanding rather than a mechanical procedure.
+that a transformation involves a holistic spatial rearrangement rather than
+a mechanical cell-by-cell procedure.
 
 **Architecture:**
 
@@ -30,7 +30,7 @@ class GuessComponent(nn.Module):
     """Self-attention predictor that handles fuzzy / non-rule patterns.
 
     :param embed_dim: Dimensionality of the shared input embedding.
-    :param num_classes: Number of output classes (CLEVR answers).
+    :param num_classes: Number of output classes.
     :param num_tokens: How many pseudo-tokens to split the embedding into.
     :param head_hidden: Hidden width of the classification MLP head.
     """
@@ -38,7 +38,7 @@ class GuessComponent(nn.Module):
     def __init__(
         self,
         embed_dim: int = 256,
-        num_classes: int = 28,
+        num_classes: int = 9000,
         num_tokens: int = 16,
         head_hidden: int = 256,
     ) -> None:

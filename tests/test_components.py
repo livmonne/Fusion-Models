@@ -19,11 +19,12 @@ from fusion_model.rule_engine import RuleGenerator
 # Shared test dimensions — kept small so tests run in milliseconds.
 BATCH = 4
 EMBED = 64
-N_CLASSES = 28
+NUM_COLOURS = 10
+MAX_GRID = 4  # small grid for fast tests
+MAX_CELLS = MAX_GRID * MAX_GRID
+N_CLASSES = MAX_CELLS * NUM_COLOURS
 N_SLOTS = 8
 RANK = 4
-VOCAB = 50
-MAX_Q_LEN = 10
 
 
 class TestRuleMemory:
@@ -55,12 +56,7 @@ class TestRuleMemory:
         assert (strength >= 0.0).all() and (strength <= 1.0).all()
 
     def test_frequency_decays_over_time(self) -> None:
-        """Frequency should decay toward zero when no retrieval happens.
-
-        We isolate the decay by zeroing out the reinforcement rate logit
-        (sigmoid → 0.5, but we set it very negative so reinforcement ≈ 0)
-        and running many forward passes.
-        """
+        """Frequency should decay toward zero when no retrieval happens."""
         mem = RuleMemory(
             embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK,
             prune_every_n_steps=0,
@@ -69,7 +65,6 @@ class TestRuleMemory:
         mem.frequency.fill_(0.8)
         mem.steps_since_activation.zero_()
 
-        # Suppress reinforcement so decay dominates.
         with torch.no_grad():
             mem.reinforce_rate_logit.fill_(-20.0)
 
@@ -84,7 +79,6 @@ class TestRuleMemory:
     def test_prune_weak_slots_resets_parameters(self) -> None:
         """Pruning should recycle dead slots and reset their strength."""
         mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
-        # Force all slots into a "forgotten" state.
         mem.frequency.fill_(0.01)
         mem.steps_since_activation.fill_(10000.0)
 
@@ -251,21 +245,55 @@ class TestFusionModel:
     def test_forward_shapes(self) -> None:
         """Full forward pass must produce correctly shaped outputs."""
         model = FusionModel(
-            vocab_size=VOCAB,
             embed_dim=EMBED,
-            num_classes=N_CLASSES,
+            num_colours=NUM_COLOURS,
+            max_grid_size=MAX_GRID,
+            num_encoder_layers=1,
+            num_cross_attn_layers=1,
+            num_attn_heads=4,
             num_rule_slots=N_SLOTS,
             rule_rank=RANK,
         )
-        images = torch.randn(BATCH, 3, 224, 224)
-        questions = torch.randint(0, VOCAB, (BATCH, MAX_Q_LEN))
 
-        logits, alpha, meta = model(images, questions)
+        G = MAX_GRID
+        max_demos = 3
+        demo_inputs = torch.randint(0, NUM_COLOURS, (BATCH, max_demos, G, G))
+        demo_outputs = torch.randint(0, NUM_COLOURS, (BATCH, max_demos, G, G))
+        demo_mask = torch.ones(BATCH, max_demos, dtype=torch.bool)
+        test_input = torch.randint(0, NUM_COLOURS, (BATCH, G, G))
 
-        assert logits.shape == (BATCH, N_CLASSES)
+        logits, alpha, meta = model(demo_inputs, demo_outputs, demo_mask, test_input)
+
+        assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert alpha.shape == (BATCH, 3)
         assert "logits_mem" in meta
         assert "logits_rule" in meta
         assert "logits_guess" in meta
         assert "memory_strength" in meta
         assert meta["memory_strength"].shape == (N_SLOTS,)
+
+    def test_forward_with_padding(self) -> None:
+        """Forward pass should handle padded grids (PAD_VALUE = -1)."""
+        model = FusionModel(
+            embed_dim=EMBED,
+            num_colours=NUM_COLOURS,
+            max_grid_size=MAX_GRID,
+            num_encoder_layers=1,
+            num_cross_attn_layers=1,
+            num_attn_heads=4,
+            num_rule_slots=N_SLOTS,
+            rule_rank=RANK,
+        )
+
+        G = MAX_GRID
+        max_demos = 3
+        demo_inputs = torch.randint(0, NUM_COLOURS, (BATCH, max_demos, G, G))
+        demo_outputs = torch.randint(0, NUM_COLOURS, (BATCH, max_demos, G, G))
+        demo_mask = torch.tensor([[True, True, False]] * BATCH)
+        test_input = torch.randint(0, NUM_COLOURS, (BATCH, G, G))
+        test_input[:, 3:, :] = -1  # pad bottom rows
+
+        logits, alpha, _ = model(demo_inputs, demo_outputs, demo_mask, test_input)
+
+        assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
+        assert alpha.shape == (BATCH, 3)

@@ -88,7 +88,7 @@ class RuleMemory(nn.Module):
     handling.
 
     :param embed_dim: Dimensionality of the shared input embedding.
-    :param num_classes: Number of output classes (CLEVR answers).
+    :param num_classes: Number of output classes.
     :param num_slots: How many rule slots to allocate.
     :param rank: Inner rank of each rule's low-rank decomposition ``A @ (B @ h)``.
     :param prune_threshold: Strength below which a slot is considered
@@ -103,7 +103,7 @@ class RuleMemory(nn.Module):
     def __init__(
         self,
         embed_dim: int = 256,
-        num_classes: int = 28,
+        num_classes: int = 9000,
         num_slots: int = 16,
         rank: int = 16,
         prune_threshold: float = 0.05,
