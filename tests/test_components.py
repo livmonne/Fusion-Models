@@ -2,10 +2,15 @@
 
 Each test creates a component with small dimensions, feeds it a random
 batch, and verifies that the output shapes and value ranges are correct.
-These tests run on CPU and do not require any data files.
+These tests run on CPU and do not require any data files (except for
+parquet tests which create a temporary file on the fly).
 """
 
 from __future__ import annotations
+
+import json
+import os
+import tempfile
 
 import torch
 
@@ -15,6 +20,7 @@ from fusion_model.loss import FusionLoss
 from fusion_model.memory import RuleMemory
 from fusion_model.model import FusionModel
 from fusion_model.rule_engine import RuleGenerator
+from tasks.arc import ARCDataset, ParquetARCDataset, pad_grid
 
 # Shared test dimensions — kept small so tests run in milliseconds.
 BATCH = 4
@@ -319,3 +325,198 @@ class TestFusionModel:
 
         assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert alpha.shape == (BATCH, 3)
+
+
+# ── Hebbian gradient fix tests ───────────────────────────────────────────────
+
+
+class TestHebbianGradientFlow:
+    """Tests verifying that decay/reinforce rate parameters receive gradients."""
+
+    def test_rate_params_receive_gradients_with_divergent_freq(self) -> None:
+        """After frequencies diverge, decay/reinforce logits must have non-zero grad."""
+        mem = RuleMemory(
+            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK,
+            prune_every_n_steps=0,
+        )
+        mem.train()
+
+        # Set divergent frequencies to simulate mid-training state.
+        with torch.no_grad():
+            mem.frequency.copy_(torch.tensor([0.9, 0.7, 0.3, 0.1, 0.8, 0.05, 0.6, 0.4]))
+            mem.steps_since_activation.copy_(
+                torch.tensor([0.0, 50.0, 200.0, 500.0, 10.0, 800.0, 30.0, 150.0])
+            )
+
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
+        h = torch.randn(BATCH, EMBED)
+        logits, _, info = mem(x, h)
+
+        # Use a loss that depends on both logits and strength.
+        loss = logits.sum() + 0.001 * (info["strength"].mean() - 0.5) ** 2
+        loss.backward()
+
+        assert mem.decay_rate_logit.grad is not None
+        assert mem.reinforce_rate_logit.grad is not None
+        assert mem.recency_halflife_log.grad is not None
+
+    def test_strength_returned_with_grad(self) -> None:
+        """Returned strength must be part of the computation graph during training."""
+        mem = RuleMemory(
+            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK,
+        )
+        mem.train()
+
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
+        h = torch.randn(BATCH, EMBED)
+        _, _, info = mem(x, h)
+
+        assert info["strength"].requires_grad, (
+            "strength should be differentiable during training"
+        )
+
+    def test_no_frequency_update_at_eval(self) -> None:
+        """Frequency buffer should remain unchanged during eval forward passes."""
+        mem = RuleMemory(
+            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK,
+        )
+        mem.eval()
+        freq_before = mem.frequency.clone()
+
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
+        h = torch.randn(BATCH, EMBED)
+        mem(x, h)
+
+        assert torch.equal(mem.frequency, freq_before), (
+            "Frequency buffer should not change during eval"
+        )
+
+    def test_frequency_buffer_updates_during_training(self) -> None:
+        """self.frequency buffer should be updated after a forward pass in train mode."""
+        mem = RuleMemory(
+            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK,
+            prune_every_n_steps=0,
+        )
+        mem.train()
+        freq_before = mem.frequency.clone()
+
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
+        h = torch.randn(BATCH, EMBED)
+        mem(x, h)
+
+        assert not torch.equal(mem.frequency, freq_before), (
+            "Frequency buffer should change after a training forward pass"
+        )
+
+
+# ── Parquet dataset tests ────────────────────────────────────────────────────
+
+
+def _make_parquet_file(tmp_dir: str, n_tasks: int = 5) -> str:
+    """Create a minimal parquet file with synthetic ARC tasks."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    ids = []
+    tasks = []
+    for i in range(n_tasks):
+        task = {
+            "train": [
+                {"input": [[i, 0], [0, i]], "output": [[0, i], [i, 0]]},
+            ],
+            "test": [
+                {"input": [[i, i], [0, 0]], "output": [[0, 0], [i, i]]},
+            ],
+        }
+        ids.append(f"task_{i:04d}")
+        tasks.append(json.dumps(task))
+
+    table = pa.table({"id": ids, "task": tasks})
+    path = os.path.join(tmp_dir, "test_data.parquet")
+    pq.write_table(table, path)
+    return path
+
+
+class TestParquetARCDataset:
+    """Tests for :class:`tasks.arc.ParquetARCDataset`."""
+
+    def test_load_and_length(self) -> None:
+        """Dataset length must match the number of test pairs across all tasks."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _make_parquet_file(tmp, n_tasks=5)
+            ds = ParquetARCDataset([path])
+            # Each task has 1 test pair → 5 samples.
+            assert len(ds) == 5
+
+    def test_getitem_returns_expected_keys(self) -> None:
+        """Each sample must contain the standard ARC tensor dict."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _make_parquet_file(tmp, n_tasks=3)
+            ds = ParquetARCDataset([path], max_grid_size=4)
+            sample = ds[0]
+
+            expected_keys = {
+                "demo_inputs", "demo_outputs", "demo_mask",
+                "test_input", "test_output", "input_size", "output_size",
+            }
+            assert set(sample.keys()) == expected_keys
+
+    def test_getitem_shapes(self) -> None:
+        """Tensor shapes must match the configured grid size and demo count."""
+        G = 4
+        max_demos = 3
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _make_parquet_file(tmp, n_tasks=2)
+            ds = ParquetARCDataset([path], max_grid_size=G, max_demos=max_demos)
+            sample = ds[0]
+
+            assert sample["demo_inputs"].shape == (max_demos, G, G)
+            assert sample["demo_outputs"].shape == (max_demos, G, G)
+            assert sample["demo_mask"].shape == (max_demos,)
+            assert sample["test_input"].shape == (G, G)
+            assert sample["test_output"].shape == (G, G)
+            assert sample["input_size"].shape == (2,)
+
+    def test_max_samples_cap(self) -> None:
+        """max_samples should limit the total number of indexed samples."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _make_parquet_file(tmp, n_tasks=10)
+            ds = ParquetARCDataset([path], max_samples=3)
+            assert len(ds) == 3
+
+    def test_multiple_parquet_files(self) -> None:
+        """Dataset should load from multiple parquet files."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path1 = _make_parquet_file(tmp, n_tasks=3)
+            # Create a second file with a different name.
+            path2 = os.path.join(tmp, "test_data2.parquet")
+            import shutil
+            shutil.copy(path1, path2)
+
+            ds = ParquetARCDataset([path1, path2])
+            assert len(ds) == 6  # 3 + 3
+
+    def test_multi_test_pair_expansion(self) -> None:
+        """Tasks with multiple test pairs should be expanded into separate samples."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        with tempfile.TemporaryDirectory() as tmp:
+            task = {
+                "train": [{"input": [[1]], "output": [[2]]}],
+                "test": [
+                    {"input": [[3]], "output": [[4]]},
+                    {"input": [[5]], "output": [[6]]},
+                ],
+            }
+            table = pa.table({"id": ["multi"], "task": [json.dumps(task)]})
+            path = os.path.join(tmp, "multi.parquet")
+            pq.write_table(table, path)
+
+            ds = ParquetARCDataset([path], max_grid_size=2)
+            assert len(ds) == 2
+
+            # Verify the two samples have different test inputs.
+            s0 = ds[0]
+            s1 = ds[1]
+            assert not torch.equal(s0["test_input"], s1["test_input"])
