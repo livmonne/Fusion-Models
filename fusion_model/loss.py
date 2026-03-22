@@ -3,42 +3,24 @@
 The overall loss is a weighted sum of several terms, each addressing a
 different failure mode of the mixture-of-experts architecture:
 
-1. **Task loss** — standard cross-entropy on the combined output.  This is
-   the main learning signal.
+1. **Task loss** — standard per-cell cross-entropy on the combined output.
 
 2. **Guess penalty** — ``mean(alpha_guess)`` pushes the router away from
-   relying exclusively on the guess pathway, encouraging it to explore the
-   rule-based pathways when they are helpful.
+   relying exclusively on the guess pathway.
 
 3. **Storage cost** — an approximate L0 over rule-memory slot utilisation.
-   Penalises *uniform* usage (which wastes capacity) and rewards sparse
-   specialisation.
 
 4. **Negative entropy** — ``-entropy(alpha)`` encourages the router to
-   *explore* all three pathways early in training rather than collapsing
-   to one.
+   *explore* all three pathways early in training.
 
-5. **Auxiliary losses** — independent cross-entropy on each pathway's own
-   logits.  This ensures that every pathway receives gradient signal even
-   when the router assigns it near-zero weight, preventing "dead" pathways.
+5. **Auxiliary losses** — independent per-cell cross-entropy on each
+   pathway's own logits, ensuring every pathway receives gradient signal.
 
 6. **Commitment regularisation** — penalises the deviation of the mean
-   soft commit weight (from the RuleGenerator's proposal) from a target
-   rate.  This provides gradient signal to the proposer's key projection,
-   the ``commit_threshold_logit``, and the ``commit_temperature``
-   parameters, preventing the model from committing too aggressively or
-   never committing at all.
+   soft commit weight from a target rate.
 
 7. **Strength regularisation** — penalises the deviation of the mean
-   memory-slot strength from a target occupancy.  This prevents two
-   degenerate regimes: (a) all slots decaying to zero (total amnesia) and
-   (b) all slots saturating at 1.0 (no forgetting, defeating the purpose
-   of the mechanism).  Because the strength depends on the learnable
-   decay rate, reinforcement rate, and recency half-life, this term
-   provides indirect gradient signal to those parameters.
-
-All penalty weights (``lambda_*``) are hyperparameters that may need tuning
-for different tasks.
+   memory-slot strength from a target occupancy.
 """
 
 from __future__ import annotations
@@ -52,21 +34,24 @@ import torch.nn as nn
 class FusionLoss(nn.Module):
     """Compute the multi-component Fusion Model loss.
 
+    Now accepts **per-cell** logits ``(B, seq, C)`` and targets ``(B, seq)``
+    with a ``pad_value`` for masking, instead of the previous flattened
+    format.
+
+    :param pad_value: Target value to ignore in cross-entropy (default -1).
     :param lambda_guess: Weight for the guess-pathway penalty.
     :param lambda_storage: Weight for the rule-storage cost.
     :param lambda_entropy: Weight for the (negative) routing-entropy bonus.
     :param lambda_aux: Weight for the auxiliary per-pathway losses.
     :param lambda_commit: Weight for commitment-rate regularisation.
-    :param commit_target_rate: Desired mean commit weight across the batch
-        (soft target).
-    :param lambda_strength: Weight for the memory-strength occupancy
-        regulariser.
-    :param strength_target: Desired mean slot strength.  Values around
-        0.4–0.6 encourage a healthy mix of strong and weak memories.
+    :param commit_target_rate: Desired mean commit weight.
+    :param lambda_strength: Weight for strength occupancy regulariser.
+    :param strength_target: Desired mean slot strength.
     """
 
     def __init__(
         self,
+        pad_value: int = -1,
         lambda_guess: float = 0.01,
         lambda_storage: float = 0.001,
         lambda_entropy: float = 0.05,
@@ -77,6 +62,7 @@ class FusionLoss(nn.Module):
         strength_target: float = 0.5,
     ) -> None:
         super().__init__()
+        self.pad_value = pad_value
         self.lambda_guess = lambda_guess
         self.lambda_storage = lambda_storage
         self.lambda_entropy = lambda_entropy
@@ -85,7 +71,7 @@ class FusionLoss(nn.Module):
         self.commit_target_rate = commit_target_rate
         self.lambda_strength = lambda_strength
         self.strength_target = strength_target
-        self.ce = nn.CrossEntropyLoss()
+        self.ce = nn.CrossEntropyLoss(ignore_index=pad_value)
 
     def forward(
         self,
@@ -97,55 +83,52 @@ class FusionLoss(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute the total loss and a breakdown dict.
 
-        :param logits: Combined model logits ``(batch, num_classes)``.
-        :param targets: Ground-truth class indices ``(batch,)``.
+        :param logits: Per-cell logits ``(batch, seq, num_colours)``.
+        :param targets: Ground-truth cell values ``(batch, seq)`` with
+            ``pad_value`` for padding.
         :param alphas: Routing weights ``(batch, 3)``.
         :param retrieval_scores: Memory retrieval scores ``(batch, num_slots)``.
-        :param metadata: Optional dict with per-pathway logits
-            (``logits_mem``, ``logits_rule``, ``logits_guess``).
-        :return: Tuple of ``(total_loss, loss_dict)`` where *loss_dict*
-            maps component names to their scalar values.
+        :param metadata: Dict with per-pathway logits and other info.
+        :return: Tuple of ``(total_loss, loss_dict)``.
         """
-        # -- 1. Primary task loss (cross-entropy on the blended output). --
-        task_loss = self.ce(logits, targets)
+        B, S, C = logits.shape
+
+        # -- 1. Primary task loss (per-cell cross-entropy). --
+        task_loss = self.ce(logits.reshape(-1, C), targets.reshape(-1))
 
         # -- 2. Penalise over-reliance on the guess pathway. --
         guess_penalty = alphas[:, 2].mean()
 
         # -- 3. Encourage sparse rule-slot usage (approximate L0). --
-        # slot_usage is the average attention each slot receives across the batch.
-        # The product p*(1-p) peaks at 0.5 (uniform) and is zero at 0 or 1.
         slot_usage = retrieval_scores.mean(dim=0)
         storage_cost = (slot_usage * (1.0 - slot_usage)).sum()
 
-        # -- 4. Negative entropy: reward uniform alpha early, prevent collapse. --
+        # -- 4. Negative entropy: reward uniform alpha early. --
         eps = 1e-8
         entropy = -(alphas * (alphas + eps).log()).sum(dim=-1).mean()
 
-        # -- 5. Auxiliary losses keep all three pathways learning. --
+        # -- 5. Auxiliary losses: per-cell CE for each pathway. --
         aux_loss = torch.tensor(0.0, device=logits.device)
         if metadata is not None:
+            targets_flat = targets.reshape(-1)
             for key in ("logits_mem", "logits_rule", "logits_guess"):
                 if key in metadata:
-                    aux_loss = aux_loss + self.ce(metadata[key], targets)
+                    pathway_logits = metadata[key]  # (B, seq, num_colours)
+                    aux_loss = aux_loss + self.ce(
+                        pathway_logits.reshape(-1, C), targets_flat,
+                    )
             aux_loss = aux_loss / 3.0
 
         # -- 6. Commitment rate regularisation. --
-        # Nudges the mean commit weight toward a target so the proposer's
-        # key projection, threshold, and temperature receive gradient signal.
         commit_reg = torch.tensor(0.0, device=logits.device)
         if metadata is not None:
             proposal = metadata.get("proposal")
             if proposal is not None:
-                commit_weight = proposal["commit_weight"]  # (batch, 1)
+                commit_weight = proposal["commit_weight"]
                 mean_weight = commit_weight.squeeze(-1).mean()
                 commit_reg = (mean_weight - self.commit_target_rate) ** 2
 
         # -- 7. Memory-strength occupancy regularisation. --
-        # Penalises deviation of mean slot strength from a healthy target,
-        # preventing total amnesia (all strengths → 0) or total saturation
-        # (all strengths → 1).  Indirectly provides gradient signal to the
-        # learnable decay rate, reinforcement rate, and recency half-life.
         strength_reg = torch.tensor(0.0, device=logits.device)
         if metadata is not None:
             strength = metadata.get("memory_strength")
@@ -158,7 +141,7 @@ class FusionLoss(nn.Module):
             task_loss
             + self.lambda_guess * guess_penalty
             + self.lambda_storage * storage_cost
-            - self.lambda_entropy * entropy  # subtract because we *maximise* entropy
+            - self.lambda_entropy * entropy
             + self.lambda_aux * aux_loss
             + self.lambda_commit * commit_reg
             + self.lambda_strength * strength_reg

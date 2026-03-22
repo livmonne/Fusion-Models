@@ -129,7 +129,6 @@ def train_fusion(
     patience_counter = 0
     history: dict[str, list[float]] = {"train_loss": [], "train_acc": [], "val_acc": []}
 
-    ce = torch.nn.CrossEntropyLoss(ignore_index=PAD_VALUE)
     ce_per_sample = torch.nn.CrossEntropyLoss(
         ignore_index=PAD_VALUE, reduction="none",
     )
@@ -151,21 +150,16 @@ def train_fusion(
                 demo_inputs, demo_outputs, demo_mask, test_input,
             )
 
-            # Flatten targets to match logits shape.
+            # Flatten targets to match logits shape: (B, seq).
             B = test_output.size(0)
             targets_flat = test_output.view(B, -1)  # (B, G*G)
             max_cells = logits.size(1)
             targets_flat = targets_flat[:, :max_cells]
 
-            # Per-cell cross-entropy (main task loss).
-            task_loss = ce(
-                logits.reshape(-1, model.num_colours),
-                targets_flat.reshape(-1),
-            )
-
             # Per-sample loss for the rule generator's history buffer.
+            C = logits.size(-1)
             per_cell_loss = ce_per_sample(
-                logits.reshape(-1, model.num_colours),
+                logits.reshape(-1, C),
                 targets_flat.reshape(-1),
             ).view(B, -1)
             valid_mask = (targets_flat != PAD_VALUE).float()
@@ -177,18 +171,11 @@ def train_fusion(
             # Feed outcome signal to the rule generator's history.
             model.update_rule_history(per_sample_loss)
 
-            # Fusion loss components (uses the flat logits for aux losses).
-            fusion_loss, loss_dict = criterion(
-                logits.view(B, -1),
-                targets_flat.view(B, -1)[:, 0].clamp(min=0),
-                alphas,
+            # Compute combined loss (task CE + all regularisation terms).
+            loss, loss_dict = criterion(
+                logits, targets_flat, alphas,
                 meta["retrieval_scores"],
                 metadata=meta,
-            )
-
-            loss = task_loss + fusion_loss - criterion.ce(
-                logits.view(B, -1),
-                targets_flat.view(B, -1)[:, 0].clamp(min=0),
             )
 
             optimizer.zero_grad()
@@ -196,7 +183,7 @@ def train_fusion(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            epoch_loss += task_loss.item() * B
+            epoch_loss += loss_dict["task"] * B
             c, t = compute_cell_accuracy(logits, targets_flat)
             epoch_correct += c
             epoch_total += t
@@ -326,7 +313,7 @@ def main() -> None:
         num_encoder_layers=args.num_encoder_layers,
         num_cross_attn_layers=args.num_cross_attn_layers,
     ).to(device)
-    criterion = FusionLoss()
+    criterion = FusionLoss(pad_value=PAD_VALUE)
 
     print(f"Fusion Model: {count_params(model):,} trainable parameters")
     print("Training...")
