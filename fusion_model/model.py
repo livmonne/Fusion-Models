@@ -16,28 +16,20 @@ predicted output grid by inferring the transformation rule from the demos.
    The resulting token sequences are concatenated across all demos into a
    single *demo context* sequence.
 3. **Multi-head cross-attention** — the test input cell embeddings
-   cross-attend to the demo context via multiple attention heads.  Each
-   head can focus on different aspects of the demonstrated transformation
-   (e.g. colour mapping vs. spatial pattern).  This is the core mechanism
-   by which the model transfers the inferred rule to the test input.
-4. **Shared embedding** — the cross-attended test tokens are mean-pooled
-   into a single vector ``h`` of shape ``(batch, embed_dim)`` that
-   summarises the model's understanding of the task.
-5. **Three expert pathways** each process ``h`` independently and return
-   both per-cell classification logits *and* an intermediate representation
-   vector:
-   - :class:`~fusion_model.memory.RuleMemory` — retrieves stored rules
-     with **strength-gated** retrieval.
-   - :class:`~fusion_model.rule_engine.RuleGenerator` — produces ephemeral
-     corrections and proposes persistent rules via cross-attention over
-     its history buffer.
-   - :class:`~fusion_model.guess.GuessComponent` — self-attention predictor
-     for fuzzy patterns.
-6. **DecisionRouter** — multi-head cross-attention router that produces
-   softmax mixture weights ``alpha`` over the three pathways.
-7. **Output projection** — the blended pathway logits are reshaped into
-   a per-cell probability distribution over 10 colours for every position
-   in the output grid.
+   cross-attend to the demo context via multiple attention heads.
+4. **Spatial tokens + pooled embedding** — the cross-attended test tokens
+   ``x`` of shape ``(batch, seq, embed_dim)`` carry per-cell spatial
+   information.  A mean-pooled vector ``h`` summarises the task globally.
+5. **Three expert pathways** each receive the full spatial sequence ``x``
+   (and pooled ``h`` where needed) and return **per-cell colour logits**
+   ``(batch, seq, num_colours)`` plus a pooled representation for the
+   router:
+   - :class:`~fusion_model.memory.RuleMemory`
+   - :class:`~fusion_model.rule_engine.RuleGenerator`
+   - :class:`~fusion_model.guess.GuessComponent`
+6. **DecisionRouter** — produces softmax mixture weights ``alpha`` over
+   the three pathways.
+7. **Output** — the blended per-cell logits ``(batch, seq, num_colours)``.
 8. **Rule commitment** and **history update** proceed as before.
 """
 
@@ -103,9 +95,6 @@ class FusionModel(nn.Module):
     :param rule_rank: Low-rank dimension used by memory and generator.
     :param history_size: Capacity of the RuleGenerator's circular history
         buffer.
-    :param max_output_cells: Maximum number of cells in the output grid
-        (``max_grid_size ** 2``).  The expert pathways produce logits for
-        this many cells × ``num_colours``.
     """
 
     def __init__(
@@ -119,15 +108,12 @@ class FusionModel(nn.Module):
         num_rule_slots: int = 128,
         rule_rank: int = 16,
         history_size: int = 512,
-        max_output_cells: int | None = None,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
         self.num_colours = num_colours
         self.max_grid_size = max_grid_size
-        self.max_seq = max_grid_size * max_grid_size  # 900 for 30×30
-        self.max_output_cells = max_output_cells or self.max_seq
-        self.num_classes = self.max_output_cells * num_colours
+        self.max_output_cells = max_grid_size * max_grid_size  # 900 for 30×30
 
         # ── Cell embedding ────────────────────────────────────────────────
         # +1 for the PAD sentinel (-1 mapped to index num_colours).
@@ -188,19 +174,19 @@ class FusionModel(nn.Module):
         # ── Expert pathways ──────────────────────────────────────────────
         self.memory = RuleMemory(
             embed_dim=embed_dim,
-            num_classes=self.num_classes,
+            num_colours=num_colours,
             num_slots=num_rule_slots,
             rank=rule_rank,
         )
         self.rule_gen = RuleGenerator(
             embed_dim=embed_dim,
-            num_classes=self.num_classes,
+            num_colours=num_colours,
             rank=rule_rank,
             history_size=history_size,
         )
         self.guess = GuessComponent(
             embed_dim=embed_dim,
-            num_classes=self.num_classes,
+            num_colours=num_colours,
         )
 
         # ── Decision router ──────────────────────────────────────────────
@@ -216,8 +202,7 @@ class FusionModel(nn.Module):
         Must be called by the training loop *after* computing the per-sample
         loss.  Does nothing if no pending history exists (e.g. during eval).
 
-        :param outcomes: Per-sample outcome signal ``(batch,)`` — typically
-            the per-sample loss (lower = better).
+        :param outcomes: Per-sample outcome signal ``(batch,)``.
         """
         pending = getattr(self, "_pending_history", None)
         if pending is None:
@@ -234,14 +219,11 @@ class FusionModel(nn.Module):
     ) -> torch.Tensor:
         """Embed a padded grid into a sequence of token vectors.
 
-        :param grid: ``(batch, H, W)`` int tensor with values in
-            ``[0, num_colours-1]`` and ``PAD_VALUE`` (−1) for padding.
-        :param type_id: Type embedding index (0=demo_in, 1=demo_out,
-            2=test_in).
+        :param grid: ``(batch, H, W)`` int tensor.
+        :param type_id: Type embedding index (0=demo_in, 1=demo_out, 2=test_in).
         :return: ``(batch, H*W, embed_dim)`` token embeddings.
         """
         B, H, W = grid.shape
-        # Map PAD_VALUE (-1) to the padding embedding index.
         safe = grid.clone()
         safe[safe < 0] = self.num_colours
         tokens = self.cell_embed(safe.view(B, -1))  # (B, H*W, embed_dim)
@@ -262,41 +244,34 @@ class FusionModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Run the full Fusion Model forward pass.
 
-        :param demo_inputs: ``(batch, max_demos, G, G)`` padded demo input
-            grids.
-        :param demo_outputs: ``(batch, max_demos, G, G)`` padded demo
-            output grids.
-        :param demo_mask: ``(batch, max_demos)`` boolean mask; True for
-            real demo pairs.
+        :param demo_inputs: ``(batch, max_demos, G, G)`` padded demo input grids.
+        :param demo_outputs: ``(batch, max_demos, G, G)`` padded demo output grids.
+        :param demo_mask: ``(batch, max_demos)`` boolean mask.
         :param test_input: ``(batch, G, G)`` padded test input grid.
         :return: Tuple of ``(logits, alphas, metadata)`` where *logits*
-            has shape ``(batch, max_output_cells, num_colours)`` — per-cell
-            colour predictions for the output grid.
+            has shape ``(batch, max_output_cells, num_colours)``.
         """
         B, D, G, _ = demo_inputs.shape
 
         # ── 1. Encode each demo pair ─────────────────────────────────────
-        # For each demo, concatenate input + output embeddings and run
-        # through the shared Transformer encoder.
         demo_tokens_list: list[torch.Tensor] = []
 
         for d in range(D):
-            mask_d = demo_mask[:, d]  # (B,) which samples have this demo
+            mask_d = demo_mask[:, d]
             if not mask_d.any():
                 continue
 
-            inp_emb = self._embed_grid(demo_inputs[:, d], type_id=0)  # (B, seq, E)
-            out_emb = self._embed_grid(demo_outputs[:, d], type_id=1)  # (B, seq, E)
-            pair_emb = torch.cat([inp_emb, out_emb], dim=1)  # (B, 2*seq, E)
+            inp_emb = self._embed_grid(demo_inputs[:, d], type_id=0)
+            out_emb = self._embed_grid(demo_outputs[:, d], type_id=1)
+            pair_emb = torch.cat([inp_emb, out_emb], dim=1)
 
-            pair_encoded = self.demo_encoder(pair_emb)  # (B, 2*seq, E)
+            pair_encoded = self.demo_encoder(pair_emb)
 
-            # Zero out tokens for samples that don't have this demo.
             pair_encoded = pair_encoded * mask_d.float().view(B, 1, 1)
             demo_tokens_list.append(pair_encoded)
 
         if demo_tokens_list:
-            demo_context = torch.cat(demo_tokens_list, dim=1)  # (B, D'*2*seq, E)
+            demo_context = torch.cat(demo_tokens_list, dim=1)
         else:
             demo_context = torch.zeros(
                 B, 1, self.embed_dim, device=test_input.device,
@@ -319,28 +294,26 @@ class FusionModel(nn.Module):
             x = ffn_norm(x + ffn(x))
 
         # ── 4. Pool into shared embedding h ──────────────────────────────
-        # Create a mask for non-padding positions in the test input.
         pad_mask = (test_input.view(B, -1) >= 0).float()  # (B, seq)
         pad_mask_sum = pad_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
         h = (x * pad_mask.unsqueeze(-1)).sum(dim=1) / pad_mask_sum  # (B, E)
         h = self.pool_proj(h)
 
-        # ── 5. Expert pathways ───────────────────────────────────────────
-        logits_mem, mem_repr, retrieval_info = self.memory(h)
-        logits_rule, confidence, rule_repr, proposal = self.rule_gen(h)
-        logits_guess, guess_repr = self.guess(h)
+        # ── 5. Expert pathways (spatial) ─────────────────────────────────
+        # Each expert receives x (B, seq, E) and produces (B, seq, num_colours).
+        logits_mem, mem_repr, retrieval_info = self.memory(x, h)
+        logits_rule, confidence, rule_repr, proposal = self.rule_gen(x, h)
+        logits_guess, guess_repr = self.guess(x)
 
         # ── 6. Route and blend ───────────────────────────────────────────
         alpha, router_attn = self.router(h, mem_repr, rule_repr, guess_repr)
 
-        logits_flat = (
-            alpha[:, 0:1] * logits_mem
-            + alpha[:, 1:2] * logits_rule
-            + alpha[:, 2:3] * logits_guess
-        )  # (B, max_output_cells * num_colours)
-
-        # Reshape to per-cell colour logits.
-        logits = logits_flat.view(B, self.max_output_cells, self.num_colours)
+        # alpha: (B, 3) → expand for per-cell blending.
+        logits = (
+            alpha[:, 0:1].unsqueeze(-1) * logits_mem
+            + alpha[:, 1:2].unsqueeze(-1) * logits_rule
+            + alpha[:, 2:3].unsqueeze(-1) * logits_guess
+        )  # (B, seq, num_colours)
 
         # ── 7. Rule commitment (soft blend into weakest slot) ────────────
         committed = False
@@ -362,15 +335,10 @@ class FusionModel(nn.Module):
                 committed = True
                 commit_weight_used = w
 
-        # ── 8. Stash info needed for deferred history update ─────────────
-        # The outcome signal (per-sample loss) is not available until after
-        # the loss is computed, so we stash the embedding and predictions
-        # here and expose ``update_rule_history`` for the training loop to
-        # call once the loss is known.
+        # ── 8. Stash info for deferred history update ─────────────────────
         if self.training:
-            preds = logits_flat.detach().view(B, self.max_output_cells, self.num_colours)
-            pred_cells = preds[:, :, :].argmax(dim=-1)
-            pred_hash = pred_cells.sum(dim=-1) % self.rule_gen.num_classes
+            pred_cells = logits.detach().argmax(dim=-1)  # (B, seq)
+            pred_hash = pred_cells.sum(dim=-1) % self.rule_gen.decision_vocab_size
             self._pending_history = {
                 "h": h.detach(),
                 "decisions": pred_hash,

@@ -22,7 +22,6 @@ EMBED = 64
 NUM_COLOURS = 10
 MAX_GRID = 4  # small grid for fast tests
 MAX_CELLS = MAX_GRID * MAX_GRID
-N_CLASSES = MAX_CELLS * NUM_COLOURS
 N_SLOTS = 8
 RANK = 4
 
@@ -31,34 +30,36 @@ class TestRuleMemory:
     """Tests for :class:`fusion_model.memory.RuleMemory`."""
 
     def test_output_shapes(self) -> None:
-        """Logits, blended correction, and retrieval info must have the expected shapes."""
-        mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
+        """Logits, repr, and retrieval info must have the expected shapes."""
+        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
         h = torch.randn(BATCH, EMBED)
-        logits, blended, info = mem(h)
+        logits, mem_repr, info = mem(x, h)
 
-        assert logits.shape == (BATCH, N_CLASSES)
-        assert blended.shape == (BATCH, EMBED)
+        assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
+        assert mem_repr.shape == (BATCH, EMBED)
         assert info["scores"].shape == (BATCH, N_SLOTS)
         assert info["strength"].shape == (N_SLOTS,)
 
     def test_scores_sum_to_one(self) -> None:
         """Strength-gated retrieval scores must be valid probabilities."""
-        mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
+        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
         h = torch.randn(BATCH, EMBED)
-        _, _, info = mem(h)
+        _, _, info = mem(x, h)
         sums = info["scores"].sum(dim=-1)
         assert torch.allclose(sums, torch.ones(BATCH), atol=1e-5)
 
     def test_strength_in_unit_interval(self) -> None:
         """Memory strength values must lie in [0, 1]."""
-        mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
+        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
         strength = mem.get_strength()
         assert (strength >= 0.0).all() and (strength <= 1.0).all()
 
     def test_frequency_decays_over_time(self) -> None:
         """Frequency should decay toward zero when no retrieval happens."""
         mem = RuleMemory(
-            embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK,
+            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK,
             prune_every_n_steps=0,
         )
         mem.train()
@@ -68,9 +69,10 @@ class TestRuleMemory:
         with torch.no_grad():
             mem.reinforce_rate_logit.fill_(-20.0)
 
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
         h = torch.randn(BATCH, EMBED)
         for _ in range(100):
-            mem(h)
+            mem(x, h)
 
         assert (mem.frequency < 0.8).all(), (
             "Frequency should decrease when reinforcement is suppressed"
@@ -78,7 +80,7 @@ class TestRuleMemory:
 
     def test_prune_weak_slots_resets_parameters(self) -> None:
         """Pruning should recycle dead slots and reset their strength."""
-        mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
+        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
         mem.frequency.fill_(0.01)
         mem.steps_since_activation.fill_(10000.0)
 
@@ -89,7 +91,7 @@ class TestRuleMemory:
 
     def test_commit_rule_resets_strength(self) -> None:
         """Committing a rule should give the target slot a warm start."""
-        mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
+        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
         mem.frequency.fill_(0.0)
         mem.steps_since_activation.fill_(999.0)
 
@@ -103,7 +105,7 @@ class TestRuleMemory:
 
     def test_get_weakest_slot_prefers_low_strength(self) -> None:
         """get_weakest_slot should return the slot with lowest strength."""
-        mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
+        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
         mem.frequency.fill_(0.9)
         mem.steps_since_activation.zero_()
         mem.frequency[3] = 0.01
@@ -113,7 +115,7 @@ class TestRuleMemory:
 
     def test_learnable_rates_are_parameters(self) -> None:
         """Decay rate, reinforcement rate, and recency half-life must be nn.Parameters."""
-        mem = RuleMemory(embed_dim=EMBED, num_classes=N_CLASSES, num_slots=N_SLOTS, rank=RANK)
+        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
         param_names = {name for name, _ in mem.named_parameters()}
         assert "decay_rate_logit" in param_names
         assert "reinforce_rate_logit" in param_names
@@ -124,34 +126,36 @@ class TestRuleGenerator:
     """Tests for :class:`fusion_model.rule_engine.RuleGenerator`."""
 
     def test_output_shapes(self) -> None:
-        """Logits, confidence, and correction must have the expected shapes."""
-        gen = RuleGenerator(embed_dim=EMBED, num_classes=N_CLASSES, rank=RANK)
+        """Logits, confidence, and repr must have the expected shapes."""
+        gen = RuleGenerator(embed_dim=EMBED, num_colours=NUM_COLOURS, rank=RANK)
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
         h = torch.randn(BATCH, EMBED)
-        logits, confidence, correction, _proposal = gen(h)
+        logits, confidence, rule_repr, _proposal = gen(x, h)
 
-        assert logits.shape == (BATCH, N_CLASSES)
+        assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert confidence.shape == (BATCH, 1)
-        assert correction.shape == (BATCH, EMBED)
+        assert rule_repr.shape == (BATCH, EMBED)
 
     def test_confidence_range(self) -> None:
         """Confidence must lie in [0, 1] (sigmoid output)."""
-        gen = RuleGenerator(embed_dim=EMBED, num_classes=N_CLASSES, rank=RANK)
+        gen = RuleGenerator(embed_dim=EMBED, num_colours=NUM_COLOURS, rank=RANK)
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
         h = torch.randn(BATCH, EMBED)
-        _, confidence, _, _proposal = gen(h)
+        _, confidence, _, _proposal = gen(x, h)
         assert (confidence >= 0.0).all() and (confidence <= 1.0).all()
 
     def test_proposal_shapes_after_history_fill(self) -> None:
         """After enough history, propose_rule must return correctly shaped tensors."""
         min_hist = 16
         gen = RuleGenerator(
-            embed_dim=EMBED, num_classes=N_CLASSES, rank=RANK,
+            embed_dim=EMBED, num_colours=NUM_COLOURS, rank=RANK,
             history_size=64, min_history=min_hist,
         )
         gen.train()
 
         for _ in range(min_hist // BATCH + 1):
             h_fill = torch.randn(BATCH, EMBED)
-            decisions = torch.randint(0, N_CLASSES, (BATCH,))
+            decisions = torch.randint(0, gen.decision_vocab_size, (BATCH,))
             outcomes = torch.rand(BATCH)
             gen.update_history(h_fill, decisions, outcomes)
 
@@ -166,7 +170,7 @@ class TestRuleGenerator:
 
     def test_proposal_none_before_min_history(self) -> None:
         """propose_rule must return None when history is below min_history."""
-        gen = RuleGenerator(embed_dim=EMBED, num_classes=N_CLASSES, rank=RANK, min_history=64)
+        gen = RuleGenerator(embed_dim=EMBED, num_colours=NUM_COLOURS, rank=RANK, min_history=64)
         assert gen.propose_rule(BATCH) is None
 
 
@@ -175,10 +179,10 @@ class TestGuessComponent:
 
     def test_output_shapes(self) -> None:
         """Output logits and pooled representation must have expected shapes."""
-        guess = GuessComponent(embed_dim=EMBED, num_classes=N_CLASSES, num_tokens=8)
-        h = torch.randn(BATCH, EMBED)
-        logits, pooled = guess(h)
-        assert logits.shape == (BATCH, N_CLASSES)
+        guess = GuessComponent(embed_dim=EMBED, num_colours=NUM_COLOURS)
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
+        logits, pooled = guess(x)
+        assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert pooled.shape == (BATCH, EMBED)
 
 
@@ -227,15 +231,35 @@ class TestFusionLoss:
 
     def test_loss_is_scalar(self) -> None:
         """Total loss must be a scalar tensor."""
-        criterion = FusionLoss()
-        logits = torch.randn(BATCH, N_CLASSES)
-        targets = torch.randint(0, N_CLASSES, (BATCH,))
+        criterion = FusionLoss(pad_value=-1)
+        logits = torch.randn(BATCH, MAX_CELLS, NUM_COLOURS)
+        targets = torch.randint(0, NUM_COLOURS, (BATCH, MAX_CELLS))
         alphas = torch.softmax(torch.randn(BATCH, 3), dim=-1)
         scores = torch.softmax(torch.randn(BATCH, N_SLOTS), dim=-1)
 
         loss, loss_dict = criterion(logits, targets, alphas, scores)
         assert loss.shape == ()
         assert "total" in loss_dict
+
+    def test_aux_loss_uses_per_cell_ce(self) -> None:
+        """Auxiliary loss must correctly compute per-cell CE for each pathway."""
+        criterion = FusionLoss(pad_value=-1)
+        logits = torch.randn(BATCH, MAX_CELLS, NUM_COLOURS)
+        targets = torch.randint(0, NUM_COLOURS, (BATCH, MAX_CELLS))
+        # Mark some cells as padding.
+        targets[:, -4:] = -1
+        alphas = torch.softmax(torch.randn(BATCH, 3), dim=-1)
+        scores = torch.softmax(torch.randn(BATCH, N_SLOTS), dim=-1)
+
+        metadata = {
+            "logits_mem": torch.randn(BATCH, MAX_CELLS, NUM_COLOURS),
+            "logits_rule": torch.randn(BATCH, MAX_CELLS, NUM_COLOURS),
+            "logits_guess": torch.randn(BATCH, MAX_CELLS, NUM_COLOURS),
+        }
+
+        loss, loss_dict = criterion(logits, targets, alphas, scores, metadata=metadata)
+        assert loss.shape == ()
+        assert loss_dict["aux"] > 0.0
 
 
 class TestFusionModel:
@@ -265,10 +289,9 @@ class TestFusionModel:
 
         assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert alpha.shape == (BATCH, 3)
-        assert "logits_mem" in meta
-        assert "logits_rule" in meta
-        assert "logits_guess" in meta
-        assert "memory_strength" in meta
+        assert meta["logits_mem"].shape == (BATCH, MAX_CELLS, NUM_COLOURS)
+        assert meta["logits_rule"].shape == (BATCH, MAX_CELLS, NUM_COLOURS)
+        assert meta["logits_guess"].shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert meta["memory_strength"].shape == (N_SLOTS,)
 
     def test_forward_with_padding(self) -> None:
