@@ -113,6 +113,10 @@ def train_fusion(
 ) -> dict[str, list[float]]:
     """Run the full training loop for the Fusion Model.
 
+    Uses AdamW with a linear warmup phase followed by cosine annealing.
+    Supports gradient accumulation via ``args.grad_accum`` (effective batch
+    size; must be a multiple of ``args.batch_size``).
+
     :param model: The Fusion Model to train.
     :param criterion: The :class:`~fusion_model.FusionLoss` instance.
     :param train_loader: Training data loader.

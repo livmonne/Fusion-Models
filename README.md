@@ -231,8 +231,16 @@ make test
 # Train on ARC-AGI-2 (quick debug run)
 make train
 
-# Full training
+# Full training (JSON dataset)
 uv run python train.py --data_root data --epochs 40
+
+# Train with augmented parquet dataset
+uv run python train.py --parquet_dir data/parquet --data_root data --epochs 40
+
+# Train with specific parquet files and gradient accumulation
+uv run python train.py \
+    --parquet_files data/parquet/seeds_original.parquet data/parquet/rearc.parquet \
+    --data_root data --batch_size 4 --grad_accum 32 --epochs 40
 
 # Evaluate and generate visualisation plots
 uv run python evaluate.py --data_root data
@@ -251,6 +259,43 @@ input(s).  Grids are rectangular matrices of integers 0–9 (up to 30×30).
 The goal is to produce the correct output grid by inferring the
 transformation rule from the demonstrations.
 
+### Augmented Data (Parquet)
+
+The training script also supports loading augmented datasets stored as
+`.parquet` files (e.g. the
+[Giotto ARC-AGI dataset](https://zenodo.org/records/18508333) with ~1.2M
+synthetic tasks).  Each parquet file must have columns `id` (string) and
+`task` (JSON string in the standard ARC format).
+
+```
+data/
+    evaluation/              # 120 JSON files (always needed for validation)
+    parquet/                 # augmented parquet files
+        seeds_original.parquet
+        rearc.parquet
+        ...
+```
+
+Use `--parquet_dir data/parquet/` to load all parquet files in a directory,
+or `--parquet_files file1.parquet file2.parquet` to select specific files.
+Validation always reads from `data/evaluation/` (JSON).
+
+The parquet loader uses **lazy loading**: only a lightweight index is built
+at init (~20s for 1.2M tasks), and JSON is parsed on-the-fly per sample.
+RAM usage stays proportional to the compressed parquet size (~1.3 GB)
+rather than the fully materialised Python objects.
+
+### Training Dynamics
+
+The training script includes:
+
+- **LR warmup**: Linear warmup over the first `min(5, epochs // 4)` epochs
+  from `lr × 0.01` to `lr`, followed by cosine annealing.
+- **Gradient accumulation**: `--grad_accum N` sets the effective batch size
+  to `N`.  With `--batch_size 4 --grad_accum 32`, the model processes 4
+  samples at a time but accumulates gradients over 8 steps before updating.
+  `N` must be ≥ `batch_size` and divisible by it.
+
 ## Project Structure
 
 ```
@@ -263,7 +308,7 @@ fusion_model/
     decision.py         # DecisionRouter (softmax mixture weights)
     loss.py             # FusionLoss (task + regularisation terms)
 tasks/
-    arc.py              # ARC-AGI-2 dataset loader and grid utilities
+    arc.py              # ARC-AGI-2 dataset loaders (JSON + Parquet) and grid utilities
 tests/
     test_components.py  # Unit tests for all model components
 train.py                # Training loop
