@@ -37,7 +37,12 @@ The final strength is ``frequency_score * recency_score``.  Both the
 **decay rate** (which governs how fast frequency fades each step) and the
 **reinforcement rate** (which governs how much a retrieval boosts
 frequency) are *learnable parameters* — the model can discover its own
-optimal forgetting/consolidation dynamics via gradient descent.
+optimal forgetting/consolidation dynamics via gradient descent.  During
+each forward pass the new frequency is computed *differentiably* from
+the current rate parameters and used in the strength gating, providing
+the gradient path ``loss → scores → strength → new_freq → rate logits``.
+The resulting frequency value is then detached and stored in a buffer
+for the next step.
 
 Slots whose strength falls below a configurable threshold are considered
 "forgotten" and are recycled: their parameters are re-initialised with
@@ -131,12 +136,20 @@ class RuleMemory(nn.Module):
 
     # ── Strength computation ────────────────────────────────────────────
 
-    def get_strength(self) -> torch.Tensor:
+    def get_strength(
+        self, freq_override: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Compute per-slot memory strength as ``frequency_score * recency_score``.
 
+        :param freq_override: If provided, use this tensor instead of
+            ``self.frequency`` for the frequency component.  This allows
+            callers to pass a differentiable frequency tensor so that
+            gradients flow back to the decay/reinforce rate parameters.
         :return: Strength tensor of shape ``(num_slots,)`` in ``[0, 1]``.
         """
-        freq_score = self.frequency.clamp(0.0, 1.0)
+        freq_score = (
+            freq_override if freq_override is not None else self.frequency
+        ).clamp(0.0, 1.0)
 
         half_life = self.recency_halflife_log.exp().clamp(min=1.0)
         recency_score = torch.exp(-math.log(2.0) * self.steps_since_activation / half_life)
@@ -163,8 +176,21 @@ class RuleMemory(nn.Module):
         raw_scores = torch.matmul(h, self.keys.t()) / (self.embed_dim**0.5)
         raw_scores = F.softmax(raw_scores, dim=-1)  # (B, S)
 
-        # -- 2. Gate by memory strength --
-        strength = self.get_strength()  # (S,)
+        # -- 2. Compute differentiable frequency & gate by memory strength --
+        # During training, compute new_freq through the learnable decay/reinforce
+        # rate parameters so that gradients flow back to them.
+        if self.training:
+            batch_mean_scores = raw_scores.detach().mean(dim=0)  # (S,)
+            decay_rate = torch.sigmoid(self.decay_rate_logit)
+            reinforce_rate = torch.sigmoid(self.reinforce_rate_logit)
+            new_freq = (
+                self.frequency.detach().clone() * decay_rate
+                + reinforce_rate * batch_mean_scores
+            ).clamp(max=1.0)
+            strength = self.get_strength(freq_override=new_freq)  # (S,)
+        else:
+            strength = self.get_strength()  # (S,)
+
         gated_scores = raw_scores * strength.unsqueeze(0)
         scores = gated_scores / (gated_scores.sum(dim=-1, keepdim=True) + 1e-8)  # (B, S)
 
@@ -188,16 +214,10 @@ class RuleMemory(nn.Module):
         # -- 6. Router representation: mean-pool blended correction --
         mem_repr = blended.mean(dim=1)  # (B, E)
 
-        # -- 7. Update strength signals (training only) --
+        # -- 7. Persist frequency state & update recency (training only) --
         if self.training:
             with torch.no_grad():
-                batch_mean_scores = raw_scores.mean(dim=0)  # (S,)
-
-                decay_rate = torch.sigmoid(self.decay_rate_logit)
-                reinforce_rate = torch.sigmoid(self.reinforce_rate_logit)
-                self.frequency = (
-                    self.frequency * decay_rate + reinforce_rate * batch_mean_scores
-                ).clamp(max=1.0)
+                self.frequency.copy_(new_freq.detach())
 
                 self.steps_since_activation += 1
                 activated = batch_mean_scores > self.recency_activation_threshold
@@ -214,7 +234,7 @@ class RuleMemory(nn.Module):
 
         retrieval_info: dict[str, torch.Tensor] = {
             "scores": scores,
-            "strength": strength.detach(),
+            "strength": strength,
         }
         return logits_mem, mem_repr, retrieval_info
 

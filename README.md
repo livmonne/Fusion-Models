@@ -118,7 +118,10 @@ product of two independent signals inspired by neuroscience:
 All three dynamics parameters (decay rate, reinforcement rate, recency
 half-life) are **learnable** — stored as unconstrained logits and mapped
 through sigmoid/exp so the model discovers its own optimal
-forgetting/consolidation schedule via gradient descent.  A strength
+forgetting/consolidation schedule via gradient descent.  During each
+forward pass the new frequency is computed differentiably from the rate
+parameters and used in the strength gating, providing the gradient path
+`loss → scores → strength → new_freq → rate logits`.  A strength
 regularisation term in the loss prevents degenerate regimes (total amnesia
 or total saturation).
 
