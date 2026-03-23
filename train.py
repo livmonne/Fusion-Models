@@ -126,6 +126,7 @@ def train_fusion(
     :return: Dictionary with ``train_loss``, ``train_acc``, and ``val_acc``
         lists (one entry per epoch).
     """
+    print("Configuring optimizer & LR schedule...")
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
@@ -369,6 +370,7 @@ def main() -> None:
         else "cpu"
     )
     print(f"Device: {device}")
+    print("Loading datasets...")
 
     # ── Construct datasets and loaders ───────────────────────────────────
     parquet_paths: list[str] | None = None
@@ -430,6 +432,7 @@ def main() -> None:
     print(f"Train samples: {len(train_ds):,}  |  Val samples: {len(val_ds):,}")
 
     # ── Instantiate the Fusion Model ─────────────────────────────────────
+    print("Building model...")
     model = FusionModel(
         embed_dim=args.embed_dim,
         num_colours=NUM_COLOURS,
@@ -440,7 +443,6 @@ def main() -> None:
     criterion = FusionLoss(pad_value=PAD_VALUE)
 
     print(f"Fusion Model: {count_params(model):,} trainable parameters")
-    print("Training...")
 
     history = train_fusion(model, criterion, train_loader, val_loader, device, args)
 
