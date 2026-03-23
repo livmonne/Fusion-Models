@@ -75,7 +75,7 @@ def _sinusoidal_pos_encoding_2d(
          pe_w.unsqueeze(0).expand(max_h, -1, -1)],
         dim=-1,
     )  # (H, W, embed_dim)
-    return pe.reshape(max_h * max_w, embed_dim)
+    return pe
 
 
 class FusionModel(nn.Module):
@@ -227,7 +227,7 @@ class FusionModel(nn.Module):
         safe = grid.clone()
         safe[safe < 0] = self.num_colours
         tokens = self.cell_embed(safe.view(B, -1))  # (B, H*W, embed_dim)
-        tokens = tokens + self.pos_encoding[: H * W].unsqueeze(0)
+        tokens = tokens + self.pos_encoding[:H, :W].reshape(H * W, -1).unsqueeze(0)
         tokens = tokens + self.type_embed(
             torch.full((1,), type_id, device=grid.device, dtype=torch.long)
         )
@@ -251,7 +251,7 @@ class FusionModel(nn.Module):
         :return: Tuple of ``(logits, alphas, metadata)`` where *logits*
             has shape ``(batch, max_output_cells, num_colours)``.
         """
-        B, D, G, _ = demo_inputs.shape
+        B, D, H, W = demo_inputs.shape
 
         # ── 1. Encode each demo pair ─────────────────────────────────────
         demo_tokens_list: list[torch.Tensor] = []

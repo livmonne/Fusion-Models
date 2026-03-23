@@ -20,7 +20,7 @@ from fusion_model.loss import FusionLoss
 from fusion_model.memory import RuleMemory
 from fusion_model.model import FusionModel
 from fusion_model.rule_engine import RuleGenerator
-from tasks.arc import ARCDataset, ParquetARCDataset, pad_grid
+from tasks.arc import ARCDataset, ParquetARCDataset, arc_collate_fn, pad_grid
 
 # Shared test dimensions — kept small so tests run in milliseconds.
 BATCH = 4
@@ -458,23 +458,25 @@ class TestParquetARCDataset:
             expected_keys = {
                 "demo_inputs", "demo_outputs", "demo_mask",
                 "test_input", "test_output", "input_size", "output_size",
+                "grid_dims",
             }
             assert set(sample.keys()) == expected_keys
 
     def test_getitem_shapes(self) -> None:
-        """Tensor shapes must match the configured grid size and demo count."""
-        G = 4
+        """Tensor shapes must match the per-sample grid dims and demo count."""
         max_demos = 3
         with tempfile.TemporaryDirectory() as tmp:
             path = _make_parquet_file(tmp, n_tasks=2)
-            ds = ParquetARCDataset([path], max_grid_size=G, max_demos=max_demos)
+            ds = ParquetARCDataset([path], max_grid_size=4, max_demos=max_demos)
             sample = ds[0]
 
-            assert sample["demo_inputs"].shape == (max_demos, G, G)
-            assert sample["demo_outputs"].shape == (max_demos, G, G)
+            # Synthetic grids are 2×2, so sample_h=sample_w=2.
+            sh, sw = sample["grid_dims"].tolist()
+            assert sample["demo_inputs"].shape == (max_demos, sh, sw)
+            assert sample["demo_outputs"].shape == (max_demos, sh, sw)
             assert sample["demo_mask"].shape == (max_demos,)
-            assert sample["test_input"].shape == (G, G)
-            assert sample["test_output"].shape == (G, G)
+            assert sample["test_input"].shape == (sh, sw)
+            assert sample["test_output"].shape == (sh, sw)
             assert sample["input_size"].shape == (2,)
 
     def test_max_samples_cap(self) -> None:
@@ -520,3 +522,75 @@ class TestParquetARCDataset:
             s0 = ds[0]
             s1 = ds[1]
             assert not torch.equal(s0["test_input"], s1["test_input"])
+
+
+# ── Dynamic batch padding tests ─────────────────────────────────────────────
+
+
+class TestArcCollateFn:
+    """Tests for :func:`tasks.arc.arc_collate_fn`."""
+
+    def test_pads_to_batch_max(self) -> None:
+        """Collated tensors should be padded to the max dims in the batch."""
+        # Sample A: 2×2 grids, Sample B: 3×4 grids.
+        sample_a = {
+            "demo_inputs": torch.ones(2, 2, 2, dtype=torch.long),
+            "demo_outputs": torch.ones(2, 2, 2, dtype=torch.long),
+            "demo_mask": torch.tensor([True, False]),
+            "test_input": torch.ones(2, 2, dtype=torch.long),
+            "test_output": torch.ones(2, 2, dtype=torch.long),
+            "input_size": torch.tensor([2, 2]),
+            "output_size": torch.tensor([2, 2]),
+            "grid_dims": torch.tensor([2, 2]),
+        }
+        sample_b = {
+            "demo_inputs": torch.full((2, 3, 4), 2, dtype=torch.long),
+            "demo_outputs": torch.full((2, 3, 4), 2, dtype=torch.long),
+            "demo_mask": torch.tensor([True, True]),
+            "test_input": torch.full((3, 4), 2, dtype=torch.long),
+            "test_output": torch.full((3, 4), 2, dtype=torch.long),
+            "input_size": torch.tensor([3, 4]),
+            "output_size": torch.tensor([3, 4]),
+            "grid_dims": torch.tensor([3, 4]),
+        }
+
+        batch = arc_collate_fn([sample_a, sample_b])
+
+        assert batch["demo_inputs"].shape == (2, 2, 3, 4)
+        assert batch["test_input"].shape == (2, 3, 4)
+        assert batch["test_output"].shape == (2, 3, 4)
+        # Sample A's data in top-left, rest is PAD_VALUE (-1).
+        assert batch["test_input"][0, 0, 0] == 1
+        assert batch["test_input"][0, 2, 0] == -1  # padded row
+        assert batch["test_input"][0, 0, 3] == -1  # padded col
+        # Sample B fully occupies the 3×4 region.
+        assert batch["test_input"][1, 2, 3] == 2
+
+
+class TestNonSquareGridForward:
+    """Test that the model handles non-square batch grids correctly."""
+
+    def test_rectangular_grid(self) -> None:
+        """Forward pass with H != W should produce correctly shaped outputs."""
+        model = FusionModel(
+            embed_dim=EMBED,
+            num_colours=NUM_COLOURS,
+            max_grid_size=MAX_GRID,
+            num_encoder_layers=1,
+            num_cross_attn_layers=1,
+            num_attn_heads=4,
+            num_rule_slots=N_SLOTS,
+            rule_rank=RANK,
+        )
+
+        H, W = 3, MAX_GRID
+        max_demos = 2
+        demo_inputs = torch.randint(0, NUM_COLOURS, (BATCH, max_demos, H, W))
+        demo_outputs = torch.randint(0, NUM_COLOURS, (BATCH, max_demos, H, W))
+        demo_mask = torch.ones(BATCH, max_demos, dtype=torch.bool)
+        test_input = torch.randint(0, NUM_COLOURS, (BATCH, H, W))
+
+        logits, alpha, meta = model(demo_inputs, demo_outputs, demo_mask, test_input)
+
+        assert logits.shape == (BATCH, H * W, NUM_COLOURS)
+        assert alpha.shape == (BATCH, 3)
