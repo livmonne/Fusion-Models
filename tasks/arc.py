@@ -101,41 +101,66 @@ class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        """Return a single sample as a dict of padded tensors.
+        """Return a single sample as a dict of minimally-padded tensors.
+
+        Grids are padded to the sample's own max dimensions (not the global
+        max).  A custom collate function (:func:`arc_collate_fn`) re-pads
+        to the batch maximum at collation time.
 
         Keys returned:
 
-        * ``demo_inputs``  — ``(max_demos, G, G)`` padded demo input grids
-        * ``demo_outputs`` — ``(max_demos, G, G)`` padded demo output grids
+        * ``demo_inputs``  — ``(max_demos, H, W)`` padded demo input grids
+        * ``demo_outputs`` — ``(max_demos, H, W)`` padded demo output grids
         * ``demo_mask``    — ``(max_demos,)`` boolean; True for real demos
-        * ``test_input``   — ``(G, G)`` padded test input grid
-        * ``test_output``  — ``(G, G)`` padded test output grid (or all PAD)
+        * ``test_input``   — ``(H, W)`` padded test input grid
+        * ``test_output``  — ``(H, W)`` padded test output grid (or all PAD)
         * ``input_size``   — ``(2,)`` int tensor ``[H, W]`` of test input
         * ``output_size``  — ``(2,)`` int tensor ``[H, W]`` of test output
+        * ``grid_dims``    — ``(2,)`` int tensor ``[H, W]`` of padded dims
         """
         sample = self.samples[idx]
-        G = self.max_grid_size
+
+        # Compute per-sample max grid dims across all grids.
+        all_grids: list[list[list[int]]] = []
+        for demo in sample["demos"][: self.max_demos]:
+            all_grids.append(demo["input"])
+            all_grids.append(demo["output"])
+        all_grids.append(sample["test_input"])
+        if sample["test_output"] is not None:
+            all_grids.append(sample["test_output"])
+
+        sample_h = max(len(g) for g in all_grids)
+        sample_w = max(len(g[0]) if len(g) > 0 else 0 for g in all_grids)
+        # Clamp to global max for safety.
+        sample_h = min(sample_h, self.max_grid_size)
+        sample_w = min(sample_w, self.max_grid_size)
 
         # Pad demonstration pairs.
-        demo_inputs = torch.full((self.max_demos, G, G), PAD_VALUE, dtype=torch.long)
-        demo_outputs = torch.full((self.max_demos, G, G), PAD_VALUE, dtype=torch.long)
+        demo_inputs = torch.full(
+            (self.max_demos, sample_h, sample_w), PAD_VALUE, dtype=torch.long,
+        )
+        demo_outputs = torch.full(
+            (self.max_demos, sample_h, sample_w), PAD_VALUE, dtype=torch.long,
+        )
         demo_mask = torch.zeros(self.max_demos, dtype=torch.bool)
 
         for i, demo in enumerate(sample["demos"][: self.max_demos]):
-            demo_inputs[i] = pad_grid(demo["input"], G, G)
-            demo_outputs[i] = pad_grid(demo["output"], G, G)
+            demo_inputs[i] = pad_grid(demo["input"], sample_h, sample_w)
+            demo_outputs[i] = pad_grid(demo["output"], sample_h, sample_w)
             demo_mask[i] = True
 
         # Pad test grids.
-        test_input = pad_grid(sample["test_input"], G, G)
+        test_input = pad_grid(sample["test_input"], sample_h, sample_w)
         ti_h, ti_w = len(sample["test_input"]), len(sample["test_input"][0])
 
         if sample["test_output"] is not None:
-            test_output = pad_grid(sample["test_output"], G, G)
+            test_output = pad_grid(sample["test_output"], sample_h, sample_w)
             to_h = len(sample["test_output"])
             to_w = len(sample["test_output"][0]) if to_h > 0 else 0
         else:
-            test_output = torch.full((G, G), PAD_VALUE, dtype=torch.long)
+            test_output = torch.full(
+                (sample_h, sample_w), PAD_VALUE, dtype=torch.long,
+            )
             to_h, to_w = 0, 0
 
         return {
@@ -146,6 +171,7 @@ class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
             "test_output": test_output,
             "input_size": torch.tensor([ti_h, ti_w], dtype=torch.long),
             "output_size": torch.tensor([to_h, to_w], dtype=torch.long),
+            "grid_dims": torch.tensor([sample_h, sample_w], dtype=torch.long),
         }
 
 
@@ -304,34 +330,55 @@ class ParquetARCDataset(_BaseARCDataset):
             "test_output": task["test"][tp_idx].get("output"),
         }
 
-        # Re-use the shared padding logic from the base class.
-        G = self.max_grid_size
-        demo_inputs = torch.full((self.max_demos, G, G), PAD_VALUE, dtype=torch.long)
-        demo_outputs = torch.full((self.max_demos, G, G), PAD_VALUE, dtype=torch.long)
-        demo_mask = torch.zeros(self.max_demos, dtype=torch.bool)
+        # Temporarily stash sample for base class __getitem__.
+        self.samples = [sample]
+        result = super().__getitem__(0)
+        self.samples = []
+        return result
 
-        for i, demo in enumerate(sample["demos"][: self.max_demos]):
-            demo_inputs[i] = pad_grid(demo["input"], G, G)
-            demo_outputs[i] = pad_grid(demo["output"], G, G)
-            demo_mask[i] = True
 
-        test_input = pad_grid(sample["test_input"], G, G)
-        ti_h, ti_w = len(sample["test_input"]), len(sample["test_input"][0])
+# ── Collate function ────────────────────────────────────────────────────────
 
-        if sample["test_output"] is not None:
-            test_output = pad_grid(sample["test_output"], G, G)
-            to_h = len(sample["test_output"])
-            to_w = len(sample["test_output"][0]) if to_h > 0 else 0
-        else:
-            test_output = torch.full((G, G), PAD_VALUE, dtype=torch.long)
-            to_h, to_w = 0, 0
 
-        return {
-            "demo_inputs": demo_inputs,
-            "demo_outputs": demo_outputs,
-            "demo_mask": demo_mask,
-            "test_input": test_input,
-            "test_output": test_output,
-            "input_size": torch.tensor([ti_h, ti_w], dtype=torch.long),
-            "output_size": torch.tensor([to_h, to_w], dtype=torch.long),
-        }
+def arc_collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    """Collate ARC samples with dynamic per-batch padding.
+
+    Instead of padding every grid to the global maximum (30×30), this pads
+    to the maximum grid dimensions within the current batch.  This can
+    reduce sequence length by ~6× and attention memory by ~36× for typical
+    batches.
+    """
+    batch_h = max(int(s["grid_dims"][0]) for s in batch)
+    batch_w = max(int(s["grid_dims"][1]) for s in batch)
+    B = len(batch)
+    max_demos = batch[0]["demo_inputs"].size(0)
+
+    # Pre-allocate batch tensors filled with PAD_VALUE.
+    demo_inputs = torch.full((B, max_demos, batch_h, batch_w), PAD_VALUE, dtype=torch.long)
+    demo_outputs = torch.full((B, max_demos, batch_h, batch_w), PAD_VALUE, dtype=torch.long)
+    test_input = torch.full((B, batch_h, batch_w), PAD_VALUE, dtype=torch.long)
+    test_output = torch.full((B, batch_h, batch_w), PAD_VALUE, dtype=torch.long)
+
+    demo_mask_list = []
+    input_size_list = []
+    output_size_list = []
+
+    for i, s in enumerate(batch):
+        h, w = int(s["grid_dims"][0]), int(s["grid_dims"][1])
+        demo_inputs[i, :, :h, :w] = s["demo_inputs"]
+        demo_outputs[i, :, :h, :w] = s["demo_outputs"]
+        test_input[i, :h, :w] = s["test_input"]
+        test_output[i, :h, :w] = s["test_output"]
+        demo_mask_list.append(s["demo_mask"])
+        input_size_list.append(s["input_size"])
+        output_size_list.append(s["output_size"])
+
+    return {
+        "demo_inputs": demo_inputs,
+        "demo_outputs": demo_outputs,
+        "demo_mask": torch.stack(demo_mask_list),
+        "test_input": test_input,
+        "test_output": test_output,
+        "input_size": torch.stack(input_size_list),
+        "output_size": torch.stack(output_size_list),
+    }

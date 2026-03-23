@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 
 from fusion_model import FusionModel
 from fusion_model.loss import FusionLoss
-from tasks.arc import NUM_COLOURS, PAD_VALUE, ARCDataset, ParquetARCDataset
+from tasks.arc import NUM_COLOURS, PAD_VALUE, ARCDataset, ParquetARCDataset, arc_collate_fn
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -417,6 +417,7 @@ def main() -> None:
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        collate_fn=arc_collate_fn,
     )
     val_loader = DataLoader(
         val_ds,
@@ -424,6 +425,7 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
+        collate_fn=arc_collate_fn,
     )
     print(f"Train samples: {len(train_ds):,}  |  Val samples: {len(val_ds):,}")
 

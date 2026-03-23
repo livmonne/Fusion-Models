@@ -24,7 +24,7 @@ from matplotlib.colors import ListedColormap
 from torch.utils.data import DataLoader
 
 from fusion_model import FusionModel
-from tasks.arc import NUM_COLOURS, PAD_VALUE, ARCDataset
+from tasks.arc import NUM_COLOURS, PAD_VALUE, ARCDataset, arc_collate_fn
 
 matplotlib.use("Agg")
 
@@ -78,12 +78,12 @@ def gather_predictions(
             all_alphas.append(alphas.cpu())
 
             B = test_input.size(0)
-            G = test_input.size(1)
+            H, W = test_input.size(1), test_input.size(2)
             for i in range(B):
                 oh, ow = output_size[i].tolist()
                 ih, iw = input_size[i].tolist()
 
-                pred_grid = preds[i].view(G, G)[:oh, :ow].numpy() if oh > 0 and ow > 0 else np.zeros((1, 1), dtype=int)
+                pred_grid = preds[i].view(H, W)[:oh, :ow].numpy() if oh > 0 and ow > 0 else np.zeros((1, 1), dtype=int)
                 tgt_grid = test_output[i][:oh, :ow].numpy() if oh > 0 and ow > 0 else np.zeros((1, 1), dtype=int)
                 inp_grid = test_input[i].cpu()[:ih, :iw].numpy()
 
@@ -252,6 +252,7 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        collate_fn=arc_collate_fn,
     )
 
     # ── Load trained model ───────────────────────────────────────────────
@@ -261,7 +262,13 @@ def main() -> None:
         max_grid_size=args.max_grid_size,
     ).to(device)
     ckpt_path = os.path.join(args.out_dir, "fusion_best.pt")
-    model.load_state_dict(torch.load(ckpt_path, weights_only=True, map_location=device))
+    state = torch.load(ckpt_path, weights_only=True, map_location=device)
+    # Compatibility: old checkpoints have pos_encoding as (G*G, E) instead of (G, G, E).
+    pe = state.get("pos_encoding")
+    if pe is not None and pe.dim() == 2:
+        G = int(pe.size(0) ** 0.5)
+        state["pos_encoding"] = pe.view(G, G, -1)
+    model.load_state_dict(state)
     print(f"Loaded weights from {ckpt_path}")
 
     # ── Predictions ──────────────────────────────────────────────────────
