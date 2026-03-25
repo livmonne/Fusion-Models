@@ -1,5 +1,5 @@
 # =============================================================================
-# Makefile — convenience targets for the Fusion Model project.
+# Makefile — convenience targets for the Fusion Model project (JAX/Flax).
 #
 # Requires: uv (https://docs.astral.sh/uv/)
 #
@@ -22,7 +22,7 @@ all: install lint test
 # install — create a virtual environment and install all dependencies.
 # --------------------------------------------------------------------------
 install:
-	uv sync --all-extras
+	uv sync --extra dev
 
 # --------------------------------------------------------------------------
 # lint — run the ruff linter (without auto-fixing).
@@ -79,6 +79,6 @@ help:
 	@echo "  typecheck   Run mypy only"
 	@echo "  test        Run pytest test suite"
 	@echo "  precommit   Install pre-commit hooks"
-	@echo "  train       Quick debug training run (100 samples)"
+	@echo "  train       Quick debug training run"
 	@echo "  clean       Remove generated artefacts"
 	@echo "  all         install + lint + test"

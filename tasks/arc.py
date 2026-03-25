@@ -11,10 +11,10 @@ up to 30×30.  There are 10 possible cell values (visualised as colours).
 This module provides:
 
 * Constants for grid encoding (``NUM_COLOURS``, ``MAX_GRID_SIZE``).
-* PyTorch ``Dataset`` classes that yield padded/flattened grid tensors
-  ready for batched training.  :class:`ARCDataset` loads from a directory
-  of JSON files; :class:`ParquetARCDataset` loads from one or more
-  ``.parquet`` files (e.g. the Giotto augmented dataset).
+* Dataset classes that yield padded/flattened grid arrays ready for
+  batched training.  :class:`ARCDataset` loads from a directory of JSON
+  files; :class:`ParquetARCDataset` loads from one or more ``.parquet``
+  files (e.g. the Giotto augmented dataset).
 * Utility functions for padding, flattening, and reconstructing grids.
 
 Dataset structure expected on disk (JSON)::
@@ -33,8 +33,7 @@ import json
 import os
 from typing import Any
 
-import torch
-from torch.utils.data import Dataset
+import numpy as np
 
 # ── Constants ────────────────────────────────────────────────────────────────
 NUM_COLOURS: int = 10  # cell values 0-9
@@ -44,36 +43,36 @@ MAX_GRID_SIZE: int = 30  # maximum grid dimension in ARC-AGI-2
 # ── Grid utilities ───────────────────────────────────────────────────────────
 
 
-def pad_grid(grid: list[list[int]], max_h: int, max_w: int) -> torch.Tensor:
+def pad_grid(grid: list[list[int]], max_h: int, max_w: int) -> np.ndarray:
     """Pad a variable-size grid to ``(max_h, max_w)`` with :data:`PAD_VALUE`.
 
     :param grid: 2-D list of integers in ``[0, 9]``.
     :param max_h: Target height.
     :param max_w: Target width.
-    :return: ``int64`` tensor of shape ``(max_h, max_w)``.
+    :return: ``int32`` array of shape ``(max_h, max_w)``.
     """
     h = len(grid)
     w = len(grid[0]) if h > 0 else 0
-    padded = torch.full((max_h, max_w), PAD_VALUE, dtype=torch.long)
+    padded = np.full((max_h, max_w), PAD_VALUE, dtype=np.int32)
     for r in range(h):
         for c in range(len(grid[r])):
             padded[r, c] = grid[r][c]
     return padded
 
 
-def grid_to_tensor(grid: list[list[int]]) -> torch.Tensor:
-    """Convert a raw grid (list of lists) to a tensor without padding.
+def grid_to_array(grid: list[list[int]]) -> np.ndarray:
+    """Convert a raw grid (list of lists) to an array without padding.
 
     :param grid: 2-D list of integers.
-    :return: ``int64`` tensor of shape ``(H, W)``.
+    :return: ``int32`` array of shape ``(H, W)``.
     """
-    return torch.tensor(grid, dtype=torch.long)
+    return np.array(grid, dtype=np.int32)
 
 
-def unpad_grid(padded: torch.Tensor, h: int, w: int) -> list[list[int]]:
-    """Extract the top-left ``(h, w)`` region from a padded grid tensor.
+def unpad_grid(padded: np.ndarray, h: int, w: int) -> list[list[int]]:
+    """Extract the top-left ``(h, w)`` region from a padded grid array.
 
-    :param padded: Tensor of shape ``(max_h, max_w)``.
+    :param padded: Array of shape ``(max_h, max_w)``.
     :param h: True height.
     :param w: True width.
     :return: 2-D list of integers.
@@ -84,7 +83,7 @@ def unpad_grid(padded: torch.Tensor, h: int, w: int) -> list[list[int]]:
 # ── Base dataset ─────────────────────────────────────────────────────────────
 
 
-class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
+class _BaseARCDataset:
     """Shared ``__getitem__`` logic for all ARC dataset variants.
 
     Subclasses must populate ``self.samples`` (a list of dicts with keys
@@ -100,8 +99,8 @@ class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        """Return a single sample as a dict of padded tensors.
+    def __getitem__(self, idx: int) -> dict[str, np.ndarray]:
+        """Return a single sample as a dict of padded arrays.
 
         Keys returned:
 
@@ -110,16 +109,16 @@ class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
         * ``demo_mask``    — ``(max_demos,)`` boolean; True for real demos
         * ``test_input``   — ``(G, G)`` padded test input grid
         * ``test_output``  — ``(G, G)`` padded test output grid (or all PAD)
-        * ``input_size``   — ``(2,)`` int tensor ``[H, W]`` of test input
-        * ``output_size``  — ``(2,)`` int tensor ``[H, W]`` of test output
+        * ``input_size``   — ``(2,)`` int array ``[H, W]`` of test input
+        * ``output_size``  — ``(2,)`` int array ``[H, W]`` of test output
         """
         sample = self.samples[idx]
         G = self.max_grid_size
 
         # Pad demonstration pairs.
-        demo_inputs = torch.full((self.max_demos, G, G), PAD_VALUE, dtype=torch.long)
-        demo_outputs = torch.full((self.max_demos, G, G), PAD_VALUE, dtype=torch.long)
-        demo_mask = torch.zeros(self.max_demos, dtype=torch.bool)
+        demo_inputs = np.full((self.max_demos, G, G), PAD_VALUE, dtype=np.int32)
+        demo_outputs = np.full((self.max_demos, G, G), PAD_VALUE, dtype=np.int32)
+        demo_mask = np.zeros(self.max_demos, dtype=np.bool_)
 
         for i, demo in enumerate(sample["demos"][: self.max_demos]):
             demo_inputs[i] = pad_grid(demo["input"], G, G)
@@ -135,7 +134,7 @@ class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
             to_h = len(sample["test_output"])
             to_w = len(sample["test_output"][0]) if to_h > 0 else 0
         else:
-            test_output = torch.full((G, G), PAD_VALUE, dtype=torch.long)
+            test_output = np.full((G, G), PAD_VALUE, dtype=np.int32)
             to_h, to_w = 0, 0
 
         return {
@@ -144,8 +143,8 @@ class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
             "demo_mask": demo_mask,
             "test_input": test_input,
             "test_output": test_output,
-            "input_size": torch.tensor([ti_h, ti_w], dtype=torch.long),
-            "output_size": torch.tensor([to_h, to_w], dtype=torch.long),
+            "input_size": np.array([ti_h, ti_w], dtype=np.int32),
+            "output_size": np.array([to_h, to_w], dtype=np.int32),
         }
 
 
@@ -153,7 +152,7 @@ class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
 
 
 class ARCDataset(_BaseARCDataset):
-    """PyTorch dataset for ARC-AGI-2 grid transformation tasks (JSON files).
+    """Dataset for ARC-AGI-2 grid transformation tasks (JSON files).
 
     Each sample represents a single *test pair* from a task, bundled with
     all of that task's demonstration pairs as context.  The model receives
@@ -164,12 +163,9 @@ class ARCDataset(_BaseARCDataset):
     be batched.  A ``PAD_VALUE`` sentinel (−1) marks cells outside the
     original grid boundaries.
 
-    :param data_dir: Path to a directory of ARC task JSON files (e.g.
-        ``data/training/``).
+    :param data_dir: Path to a directory of ARC task JSON files.
     :param max_grid_size: Pad all grids to this square size.
     :param max_demos: Maximum number of demonstration pairs to include.
-        Tasks with more demos are truncated; tasks with fewer are
-        zero-padded.
     :param max_samples: If set, only load this many samples (for debugging).
     """
 
@@ -180,7 +176,6 @@ class ARCDataset(_BaseARCDataset):
         max_demos: int = 5,
         max_samples: int | None = None,
     ) -> None:
-        super().__init__()
         self.data_dir = data_dir
         self.max_grid_size = max_grid_size
         self.max_demos = max_demos
@@ -214,26 +209,18 @@ class ARCDataset(_BaseARCDataset):
 
 
 class ParquetARCDataset(_BaseARCDataset):
-    """PyTorch dataset that lazily loads ARC tasks from ``.parquet`` files.
+    """Dataset that lazily loads ARC tasks from ``.parquet`` files.
 
     Each parquet file must have columns ``id`` (string) and ``task``
     (JSON string with the standard ARC format:
-    ``{"train": [...], "test": [...]}``.  All test pairs within each task
-    are expanded into separate samples, matching :class:`ARCDataset`
-    behaviour.
+    ``{"train": [...], "test": [...]}``.
 
-    **Lazy loading**: Only a lightweight index is built at init time
-    (mapping each sample to a table row + test-pair offset).  The actual
-    JSON parsing and grid construction happen on-the-fly in
-    ``__getitem__``.  This keeps RAM usage proportional to the compressed
-    parquet size (~1.3 GB for the full Giotto dataset) rather than the
-    fully materialised Python objects (~95 GB).
+    **Lazy loading**: Only a lightweight index is built at init time.
 
     :param parquet_paths: List of paths to ``.parquet`` files to load.
     :param max_grid_size: Pad all grids to this square size.
     :param max_demos: Maximum number of demonstration pairs to include.
-    :param max_samples: If set, only index this many samples (for
-        debugging).
+    :param max_samples: If set, only index this many samples.
     """
 
     def __init__(
@@ -243,21 +230,19 @@ class ParquetARCDataset(_BaseARCDataset):
         max_demos: int = 5,
         max_samples: int | None = None,
     ) -> None:
-        super().__init__()
         self.max_grid_size = max_grid_size
         self.max_demos = max_demos
 
-        # Populated by _build_index; not used by __getitem__ (lazy).
         self.samples: list[dict[str, Any]] = []
 
-        self._tables: list[Any] = []  # pyarrow Tables kept in memory
-        self._index: list[tuple[int, int, int]] = []  # (table_idx, row_idx, test_pair_idx)
+        self._tables: list[Any] = []
+        self._index: list[tuple[int, int, int]] = []
         self._build_index(parquet_paths, max_samples)
 
     def _build_index(
         self, parquet_paths: list[str], max_samples: int | None
     ) -> None:
-        """Scan parquet files and build a sample index without materialising grids."""
+        """Scan parquet files and build a sample index."""
         import pyarrow.parquet as pq
 
         for path in parquet_paths:
@@ -267,7 +252,6 @@ class ParquetARCDataset(_BaseARCDataset):
 
             tasks_col = table.column("task")
             for row_idx in range(len(table)):
-                # Quick parse to count test pairs only.
                 task: dict[str, Any] = json.loads(tasks_col[row_idx].as_py())
                 n_test = len(task.get("test", []))
                 for tp_idx in range(n_test):
@@ -284,13 +268,11 @@ class ParquetARCDataset(_BaseARCDataset):
             f"{len(self._tables)} parquet file(s)"
         )
 
-    # ── Overrides ─────────────────────────────────────────────────────────
-
     def __len__(self) -> int:
         return len(self._index)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        """Parse one task on-the-fly and return padded tensors."""
+    def __getitem__(self, idx: int) -> dict[str, np.ndarray]:
+        """Parse one task on-the-fly and return padded arrays."""
         t_idx, row_idx, tp_idx = self._index[idx]
         table = self._tables[t_idx]
 
@@ -304,11 +286,10 @@ class ParquetARCDataset(_BaseARCDataset):
             "test_output": task["test"][tp_idx].get("output"),
         }
 
-        # Re-use the shared padding logic from the base class.
         G = self.max_grid_size
-        demo_inputs = torch.full((self.max_demos, G, G), PAD_VALUE, dtype=torch.long)
-        demo_outputs = torch.full((self.max_demos, G, G), PAD_VALUE, dtype=torch.long)
-        demo_mask = torch.zeros(self.max_demos, dtype=torch.bool)
+        demo_inputs = np.full((self.max_demos, G, G), PAD_VALUE, dtype=np.int32)
+        demo_outputs = np.full((self.max_demos, G, G), PAD_VALUE, dtype=np.int32)
+        demo_mask = np.zeros(self.max_demos, dtype=np.bool_)
 
         for i, demo in enumerate(sample["demos"][: self.max_demos]):
             demo_inputs[i] = pad_grid(demo["input"], G, G)
@@ -323,7 +304,7 @@ class ParquetARCDataset(_BaseARCDataset):
             to_h = len(sample["test_output"])
             to_w = len(sample["test_output"][0]) if to_h > 0 else 0
         else:
-            test_output = torch.full((G, G), PAD_VALUE, dtype=torch.long)
+            test_output = np.full((G, G), PAD_VALUE, dtype=np.int32)
             to_h, to_w = 0, 0
 
         return {
@@ -332,6 +313,41 @@ class ParquetARCDataset(_BaseARCDataset):
             "demo_mask": demo_mask,
             "test_input": test_input,
             "test_output": test_output,
-            "input_size": torch.tensor([ti_h, ti_w], dtype=torch.long),
-            "output_size": torch.tensor([to_h, to_w], dtype=torch.long),
+            "input_size": np.array([ti_h, ti_w], dtype=np.int32),
+            "output_size": np.array([to_h, to_w], dtype=np.int32),
         }
+
+
+# ── Data loading utilities ───────────────────────────────────────────────────
+
+
+def collate_batch(samples: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    """Stack a list of samples into a batched dict of numpy arrays."""
+    return {key: np.stack([s[key] for s in samples]) for key in samples[0]}
+
+
+def data_loader(
+    dataset: _BaseARCDataset,
+    batch_size: int,
+    shuffle: bool = False,
+    rng: np.random.Generator | None = None,
+) -> Any:
+    """Simple generator-based data loader (no multiprocessing).
+
+    :param dataset: An ARC dataset instance.
+    :param batch_size: Number of samples per batch.
+    :param shuffle: Whether to shuffle indices each epoch.
+    :param rng: NumPy random generator for shuffling.
+    :yields: Batched dicts of numpy arrays.
+    """
+    n = len(dataset)
+    indices = np.arange(n)
+    if shuffle:
+        if rng is None:
+            rng = np.random.default_rng()
+        rng.shuffle(indices)
+
+    for start in range(0, n, batch_size):
+        batch_indices = indices[start : start + batch_size]
+        samples = [dataset[int(i)] for i in batch_indices]
+        yield collate_batch(samples)

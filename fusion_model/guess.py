@@ -18,8 +18,8 @@ a mechanical cell-by-cell procedure.
 
 from __future__ import annotations
 
-import torch
-import torch.nn as nn
+import jax.numpy as jnp
+import flax.linen as nn
 
 
 class GuessComponent(nn.Module):
@@ -33,45 +33,40 @@ class GuessComponent(nn.Module):
     :param num_heads: Number of self-attention heads.
     """
 
-    def __init__(
-        self,
-        embed_dim: int = 256,
-        num_colours: int = 10,
-        num_heads: int = 4,
-    ) -> None:
-        super().__init__()
-        self.embed_dim = embed_dim
+    embed_dim: int = 256
+    num_colours: int = 10
+    num_heads: int = 4
 
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim, num_heads, dropout=0.1, batch_first=True,
-        )
-        self.norm = nn.LayerNorm(embed_dim)
-        self.dropout = nn.Dropout(0.1)
-
-        # Per-token classification head.
-        self.head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(embed_dim, num_colours),
-        )
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    @nn.compact
+    def __call__(
+        self, x: jnp.ndarray, *, training: bool = False,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Compute per-token guess-pathway logits.
 
         :param x: Spatial token embeddings ``(batch, seq, embed_dim)``.
+        :param training: Whether we are in training mode.
         :return: Tuple of ``(logits, pooled)`` where *logits* has shape
             ``(batch, seq, num_colours)`` and *pooled* is ``(batch, embed_dim)``
             for the router.
         """
         # Self-attention over spatial tokens.
-        attended, _ = self.self_attn(x, x, x)
-        tokens = self.norm(x + self.dropout(attended))  # (B, seq, E)
+        attended = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.embed_dim,
+            dropout_rate=0.1,
+            deterministic=not training,
+            name="self_attn",
+        )(x, x)
+        dropped = nn.Dropout(0.1, deterministic=not training)(attended)
+        tokens = nn.LayerNorm(name="norm")(x + dropped)  # (B, seq, E)
 
         # Per-token classification.
-        logits_guess: torch.Tensor = self.head(tokens)  # (B, seq, num_colours)
+        hidden = nn.Dense(self.embed_dim, name="head_dense1")(tokens)
+        hidden = nn.gelu(hidden)
+        hidden = nn.Dropout(0.1, deterministic=not training)(hidden)
+        logits_guess = nn.Dense(self.num_colours, name="head_dense2")(hidden)
 
         # Router representation: mean-pool.
-        pooled = tokens.mean(dim=1)  # (B, E)
+        pooled = tokens.mean(axis=1)  # (B, E)
 
         return logits_guess, pooled

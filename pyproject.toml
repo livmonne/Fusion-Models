@@ -1,5 +1,5 @@
 # =============================================================================
-# Fusion Model — UV project configuration
+# Fusion Model — UV project configuration (JAX/Flax)
 #
 # This file defines the project metadata, dependencies, and tool settings
 # for the Fusion Model proof-of-concept.  It replaces requirements.txt and
@@ -9,17 +9,23 @@
 [project]
 name = "fusion-model"
 version = "0.1.0"
-description = "Fusion Model: memory + rule + guess + decision router for ARC-AGI-2"
+description = "Fusion Model: memory + rule + guess + decision router for ARC-AGI-2 (JAX/Flax)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "torch>=2.0",
+    "jax>=0.4.20",
+    "jaxlib>=0.4.20",
+    "flax>=0.8.0",
+    "optax>=0.2.0",
     "numpy",
     "matplotlib",
     "pyarrow",
 ]
 
 [project.optional-dependencies]
+tpu = [
+    "jax[tpu]>=0.4.20",
+]
 dev = [
     "ruff",
     "mypy",
@@ -49,7 +55,7 @@ select = ["E", "F", "W", "I", "B", "N"]
 ignore = [
     "N803",   # allow uppercase variable names like A, B, W (common in math)
     "N806",   # allow uppercase variable names inside functions
-    "N812",   # allow `import torch.nn.functional as F` (universal PyTorch convention)
+    "N812",   # allow `import torch.nn.functional as F` (universal convention)
     "E501",   # line length handled separately by formatter
 ]
 

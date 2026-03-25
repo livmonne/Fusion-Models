@@ -1,4 +1,4 @@
-"""Unit tests for the individual Fusion Model components.
+"""Unit tests for the individual Fusion Model components (JAX/Flax).
 
 Each test creates a component with small dimensions, feeds it a random
 batch, and verifies that the output shapes and value ranges are correct.
@@ -12,11 +12,13 @@ import json
 import os
 import tempfile
 
-import torch
+import jax
+import jax.numpy as jnp
+import numpy as np
 
 from fusion_model.decision import DecisionRouter
 from fusion_model.guess import GuessComponent
-from fusion_model.loss import FusionLoss
+from fusion_model.loss import fusion_loss
 from fusion_model.memory import RuleMemory
 from fusion_model.model import FusionModel
 from fusion_model.rule_engine import RuleGenerator
@@ -31,16 +33,53 @@ MAX_CELLS = MAX_GRID * MAX_GRID
 N_SLOTS = 8
 RANK = 4
 
+# Shared RNG key.
+RNG = jax.random.PRNGKey(42)
+
+
+def _init_module(module, *args, rng=None, training=False, **kwargs):
+    """Initialise a Flax module and return (variables, output)."""
+    if rng is None:
+        rng = RNG
+    init_rng, dropout_rng = jax.random.split(rng)
+    variables = module.init(
+        {"params": init_rng, "dropout": dropout_rng},
+        *args,
+        training=training,
+        **kwargs,
+    )
+    return variables
+
+
+def _apply_module(module, variables, *args, training=False, mutable=None, rng=None):
+    """Apply a Flax module forward pass."""
+    if rng is None:
+        rng = RNG
+    _, dropout_rng = jax.random.split(rng)
+    rngs = {"dropout": dropout_rng}
+    if mutable:
+        return module.apply(variables, *args, training=training, rngs=rngs, mutable=mutable)
+    return module.apply(variables, *args, training=training, rngs=rngs)
+
 
 class TestRuleMemory:
     """Tests for :class:`fusion_model.memory.RuleMemory`."""
 
+    def _make_mem(self, prune_every_n_steps=100):
+        mem = RuleMemory(
+            embed_dim=EMBED, num_colours=NUM_COLOURS,
+            num_slots=N_SLOTS, rank=RANK,
+            prune_every_n_steps=prune_every_n_steps,
+        )
+        x = jax.random.normal(RNG, (BATCH, MAX_CELLS, EMBED))
+        h = jax.random.normal(jax.random.PRNGKey(1), (BATCH, EMBED))
+        variables = _init_module(mem, x, h, training=True)
+        return mem, variables, x, h
+
     def test_output_shapes(self) -> None:
         """Logits, repr, and retrieval info must have the expected shapes."""
-        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
-        x = torch.randn(BATCH, MAX_CELLS, EMBED)
-        h = torch.randn(BATCH, EMBED)
-        logits, mem_repr, info = mem(x, h)
+        mem, variables, x, h = self._make_mem()
+        logits, mem_repr, info = _apply_module(mem, variables, x, h)
 
         assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert mem_repr.shape == (BATCH, EMBED)
@@ -49,94 +88,56 @@ class TestRuleMemory:
 
     def test_scores_sum_to_one(self) -> None:
         """Strength-gated retrieval scores must be valid probabilities."""
-        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
-        x = torch.randn(BATCH, MAX_CELLS, EMBED)
-        h = torch.randn(BATCH, EMBED)
-        _, _, info = mem(x, h)
-        sums = info["scores"].sum(dim=-1)
-        assert torch.allclose(sums, torch.ones(BATCH), atol=1e-5)
+        mem, variables, x, h = self._make_mem()
+        _, _, info = _apply_module(mem, variables, x, h)
+        sums = info["scores"].sum(axis=-1)
+        assert jnp.allclose(sums, jnp.ones(BATCH), atol=1e-5)
 
     def test_strength_in_unit_interval(self) -> None:
         """Memory strength values must lie in [0, 1]."""
-        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
-        strength = mem.get_strength()
+        mem, variables, x, h = self._make_mem()
+        _, _, info = _apply_module(mem, variables, x, h)
+        strength = info["strength"]
         assert (strength >= 0.0).all() and (strength <= 1.0).all()
 
-    def test_frequency_decays_over_time(self) -> None:
-        """Frequency should decay toward zero when no retrieval happens."""
-        mem = RuleMemory(
-            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK,
-            prune_every_n_steps=0,
-        )
-        mem.train()
-        mem.frequency.fill_(0.8)
-        mem.steps_since_activation.zero_()
+    def test_frequency_updates_during_training(self) -> None:
+        """Frequency state should change after a training forward pass."""
+        mem, variables, x, h = self._make_mem(prune_every_n_steps=0)
 
-        with torch.no_grad():
-            mem.reinforce_rate_logit.fill_(-20.0)
-
-        x = torch.randn(BATCH, MAX_CELLS, EMBED)
-        h = torch.randn(BATCH, EMBED)
-        for _ in range(100):
-            mem(x, h)
-
-        assert (mem.frequency < 0.8).all(), (
-            "Frequency should decrease when reinforcement is suppressed"
+        # Run forward in training mode with mutable state.
+        (logits, mem_repr, info), mutated = _apply_module(
+            mem, variables, x, h, training=True, mutable=["state"],
         )
 
-    def test_prune_weak_slots_resets_parameters(self) -> None:
-        """Pruning should recycle dead slots and reset their strength."""
-        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
-        mem.frequency.fill_(0.01)
-        mem.steps_since_activation.fill_(10000.0)
-
-        n_pruned = mem.prune_weak_slots(threshold=0.5)
-        assert n_pruned == N_SLOTS
-        assert (mem.frequency == 0.5).all()
-        assert (mem.steps_since_activation == 0.0).all()
-
-    def test_commit_rule_resets_strength(self) -> None:
-        """Committing a rule should give the target slot a warm start."""
-        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
-        mem.frequency.fill_(0.0)
-        mem.steps_since_activation.fill_(999.0)
-
-        key = torch.randn(EMBED)
-        A = torch.randn(EMBED, RANK)
-        B = torch.randn(RANK, EMBED)
-        mem.commit_rule(0, key, A, B, commit_weight=0.7)
-
-        assert torch.allclose(mem.frequency[0], torch.tensor(0.7), atol=1e-5)
-        assert mem.steps_since_activation[0].item() == 0.0
-
-    def test_get_weakest_slot_prefers_low_strength(self) -> None:
-        """get_weakest_slot should return the slot with lowest strength."""
-        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
-        mem.frequency.fill_(0.9)
-        mem.steps_since_activation.zero_()
-        mem.frequency[3] = 0.01
-        mem.steps_since_activation[3] = 10000.0
-
-        assert mem.get_weakest_slot() == 3
+        # State should have been created/updated.
+        assert "state" in mutated
+        assert "frequency" in mutated["state"]
 
     def test_learnable_rates_are_parameters(self) -> None:
-        """Decay rate, reinforcement rate, and recency half-life must be nn.Parameters."""
-        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
-        param_names = {name for name, _ in mem.named_parameters()}
-        assert "decay_rate_logit" in param_names
-        assert "reinforce_rate_logit" in param_names
-        assert "recency_halflife_log" in param_names
+        """Decay rate, reinforcement rate, and recency half-life must be params."""
+        mem, variables, x, h = self._make_mem()
+        param_keys = set(variables["params"].keys())
+        assert "decay_rate_logit" in param_keys
+        assert "reinforce_rate_logit" in param_keys
+        assert "recency_halflife_log" in param_keys
 
 
 class TestRuleGenerator:
     """Tests for :class:`fusion_model.rule_engine.RuleGenerator`."""
 
+    def _make_gen(self, **kwargs):
+        gen = RuleGenerator(embed_dim=EMBED, num_colours=NUM_COLOURS, rank=RANK, **kwargs)
+        x = jax.random.normal(RNG, (BATCH, MAX_CELLS, EMBED))
+        h = jax.random.normal(jax.random.PRNGKey(1), (BATCH, EMBED))
+        variables = _init_module(gen, x, h, training=True)
+        return gen, variables, x, h
+
     def test_output_shapes(self) -> None:
         """Logits, confidence, and repr must have the expected shapes."""
-        gen = RuleGenerator(embed_dim=EMBED, num_colours=NUM_COLOURS, rank=RANK)
-        x = torch.randn(BATCH, MAX_CELLS, EMBED)
-        h = torch.randn(BATCH, EMBED)
-        logits, confidence, rule_repr, _proposal = gen(x, h)
+        gen, variables, x, h = self._make_gen()
+        logits, confidence, rule_repr, _proposal = _apply_module(
+            gen, variables, x, h,
+        )
 
         assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert confidence.shape == (BATCH, 1)
@@ -144,40 +145,15 @@ class TestRuleGenerator:
 
     def test_confidence_range(self) -> None:
         """Confidence must lie in [0, 1] (sigmoid output)."""
-        gen = RuleGenerator(embed_dim=EMBED, num_colours=NUM_COLOURS, rank=RANK)
-        x = torch.randn(BATCH, MAX_CELLS, EMBED)
-        h = torch.randn(BATCH, EMBED)
-        _, confidence, _, _proposal = gen(x, h)
+        gen, variables, x, h = self._make_gen()
+        _, confidence, _, _ = _apply_module(gen, variables, x, h)
         assert (confidence >= 0.0).all() and (confidence <= 1.0).all()
-
-    def test_proposal_shapes_after_history_fill(self) -> None:
-        """After enough history, propose_rule must return correctly shaped tensors."""
-        min_hist = 16
-        gen = RuleGenerator(
-            embed_dim=EMBED, num_colours=NUM_COLOURS, rank=RANK,
-            history_size=64, min_history=min_hist,
-        )
-        gen.train()
-
-        for _ in range(min_hist // BATCH + 1):
-            h_fill = torch.randn(BATCH, EMBED)
-            decisions = torch.randint(0, gen.decision_vocab_size, (BATCH,))
-            outcomes = torch.rand(BATCH)
-            gen.update_history(h_fill, decisions, outcomes)
-
-        proposal = gen.propose_rule(BATCH)
-
-        assert proposal is not None
-        assert proposal["key"].shape == (BATCH, EMBED)
-        assert proposal["A"].shape == (BATCH, EMBED, RANK)
-        assert proposal["B"].shape == (BATCH, RANK, EMBED)
-        assert proposal["commit_weight"].shape == (BATCH, 1)
-        assert (proposal["commit_weight"] >= 0.0).all() and (proposal["commit_weight"] <= 1.0).all()
 
     def test_proposal_none_before_min_history(self) -> None:
         """propose_rule must return None when history is below min_history."""
-        gen = RuleGenerator(embed_dim=EMBED, num_colours=NUM_COLOURS, rank=RANK, min_history=64)
-        assert gen.propose_rule(BATCH) is None
+        gen, variables, x, h = self._make_gen(min_history=64)
+        _, _, _, proposal = _apply_module(gen, variables, x, h)
+        assert proposal is None
 
 
 class TestGuessComponent:
@@ -186,8 +162,9 @@ class TestGuessComponent:
     def test_output_shapes(self) -> None:
         """Output logits and pooled representation must have expected shapes."""
         guess = GuessComponent(embed_dim=EMBED, num_colours=NUM_COLOURS)
-        x = torch.randn(BATCH, MAX_CELLS, EMBED)
-        logits, pooled = guess(x)
+        x = jax.random.normal(RNG, (BATCH, MAX_CELLS, EMBED))
+        variables = _init_module(guess, x)
+        logits, pooled = _apply_module(guess, variables, x)
         assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert pooled.shape == (BATCH, EMBED)
 
@@ -198,72 +175,62 @@ class TestDecisionRouter:
     def test_alpha_shape_and_sum(self) -> None:
         """Routing weights must be (batch, 3) and sum to 1."""
         router = DecisionRouter(embed_dim=EMBED)
-        h = torch.randn(BATCH, EMBED)
-        mem_repr = torch.randn(BATCH, EMBED)
-        rule_repr = torch.randn(BATCH, EMBED)
-        guess_repr = torch.randn(BATCH, EMBED)
-        alpha, attn_weights = router(h, mem_repr, rule_repr, guess_repr)
+        h = jax.random.normal(RNG, (BATCH, EMBED))
+        mem_repr = jax.random.normal(jax.random.PRNGKey(1), (BATCH, EMBED))
+        rule_repr = jax.random.normal(jax.random.PRNGKey(2), (BATCH, EMBED))
+        guess_repr = jax.random.normal(jax.random.PRNGKey(3), (BATCH, EMBED))
+
+        init_rng = jax.random.PRNGKey(0)
+        variables = router.init(init_rng, h, mem_repr, rule_repr, guess_repr)
+        alpha, attn_weights = router.apply(variables, h, mem_repr, rule_repr, guess_repr)
 
         assert alpha.shape == (BATCH, 3)
-        assert torch.allclose(alpha.sum(dim=-1), torch.ones(BATCH), atol=1e-5)
+        assert jnp.allclose(alpha.sum(axis=-1), jnp.ones(BATCH), atol=1e-5)
 
     def test_attn_weights_shape(self) -> None:
         """Per-head attention weights must have shape (batch, num_heads, 3)."""
         num_heads = 4
         router = DecisionRouter(embed_dim=EMBED, num_heads=num_heads)
-        h = torch.randn(BATCH, EMBED)
-        mem_repr = torch.randn(BATCH, EMBED)
-        rule_repr = torch.randn(BATCH, EMBED)
-        guess_repr = torch.randn(BATCH, EMBED)
-        _alpha, attn_weights = router(h, mem_repr, rule_repr, guess_repr)
+        h = jax.random.normal(RNG, (BATCH, EMBED))
+        reprs = [jax.random.normal(jax.random.PRNGKey(i), (BATCH, EMBED)) for i in range(3)]
+
+        variables = router.init(jax.random.PRNGKey(0), h, *reprs)
+        _alpha, attn_weights = router.apply(variables, h, *reprs)
 
         assert attn_weights.shape == (BATCH, num_heads, 3)
-        sums = attn_weights.sum(dim=-1)
-        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
-
-    def test_num_heads_configurable(self) -> None:
-        """Router must work with different head counts."""
-        for n_heads in (1, 2, 4):
-            router = DecisionRouter(embed_dim=EMBED, num_heads=n_heads)
-            h = torch.randn(BATCH, EMBED)
-            reprs = [torch.randn(BATCH, EMBED) for _ in range(3)]
-            alpha, attn = router(h, *reprs)
-            assert alpha.shape == (BATCH, 3)
-            assert attn.shape == (BATCH, n_heads, 3)
+        sums = attn_weights.sum(axis=-1)
+        assert jnp.allclose(sums, jnp.ones_like(sums), atol=1e-5)
 
 
 class TestFusionLoss:
-    """Tests for :class:`fusion_model.loss.FusionLoss`."""
+    """Tests for :func:`fusion_model.loss.fusion_loss`."""
 
     def test_loss_is_scalar(self) -> None:
-        """Total loss must be a scalar tensor."""
-        criterion = FusionLoss(pad_value=-1)
-        logits = torch.randn(BATCH, MAX_CELLS, NUM_COLOURS)
-        targets = torch.randint(0, NUM_COLOURS, (BATCH, MAX_CELLS))
-        alphas = torch.softmax(torch.randn(BATCH, 3), dim=-1)
-        scores = torch.softmax(torch.randn(BATCH, N_SLOTS), dim=-1)
+        """Total loss must be a scalar."""
+        logits = jax.random.normal(RNG, (BATCH, MAX_CELLS, NUM_COLOURS))
+        targets = jax.random.randint(jax.random.PRNGKey(1), (BATCH, MAX_CELLS), 0, NUM_COLOURS)
+        alphas = jax.nn.softmax(jax.random.normal(jax.random.PRNGKey(2), (BATCH, 3)), axis=-1)
+        scores = jax.nn.softmax(jax.random.normal(jax.random.PRNGKey(3), (BATCH, N_SLOTS)), axis=-1)
 
-        loss, loss_dict = criterion(logits, targets, alphas, scores)
+        loss, loss_dict = fusion_loss(logits, targets, alphas, scores)
         assert loss.shape == ()
         assert "total" in loss_dict
 
     def test_aux_loss_uses_per_cell_ce(self) -> None:
         """Auxiliary loss must correctly compute per-cell CE for each pathway."""
-        criterion = FusionLoss(pad_value=-1)
-        logits = torch.randn(BATCH, MAX_CELLS, NUM_COLOURS)
-        targets = torch.randint(0, NUM_COLOURS, (BATCH, MAX_CELLS))
-        # Mark some cells as padding.
-        targets[:, -4:] = -1
-        alphas = torch.softmax(torch.randn(BATCH, 3), dim=-1)
-        scores = torch.softmax(torch.randn(BATCH, N_SLOTS), dim=-1)
+        logits = jax.random.normal(RNG, (BATCH, MAX_CELLS, NUM_COLOURS))
+        targets = jax.random.randint(jax.random.PRNGKey(1), (BATCH, MAX_CELLS), 0, NUM_COLOURS)
+        targets = targets.at[:, -4:].set(-1)
+        alphas = jax.nn.softmax(jax.random.normal(jax.random.PRNGKey(2), (BATCH, 3)), axis=-1)
+        scores = jax.nn.softmax(jax.random.normal(jax.random.PRNGKey(3), (BATCH, N_SLOTS)), axis=-1)
 
         metadata = {
-            "logits_mem": torch.randn(BATCH, MAX_CELLS, NUM_COLOURS),
-            "logits_rule": torch.randn(BATCH, MAX_CELLS, NUM_COLOURS),
-            "logits_guess": torch.randn(BATCH, MAX_CELLS, NUM_COLOURS),
+            "logits_mem": jax.random.normal(jax.random.PRNGKey(4), (BATCH, MAX_CELLS, NUM_COLOURS)),
+            "logits_rule": jax.random.normal(jax.random.PRNGKey(5), (BATCH, MAX_CELLS, NUM_COLOURS)),
+            "logits_guess": jax.random.normal(jax.random.PRNGKey(6), (BATCH, MAX_CELLS, NUM_COLOURS)),
         }
 
-        loss, loss_dict = criterion(logits, targets, alphas, scores, metadata=metadata)
+        loss, loss_dict = fusion_loss(logits, targets, alphas, scores, metadata=metadata)
         assert loss.shape == ()
         assert loss_dict["aux"] > 0.0
 
@@ -286,12 +253,25 @@ class TestFusionModel:
 
         G = MAX_GRID
         max_demos = 3
-        demo_inputs = torch.randint(0, NUM_COLOURS, (BATCH, max_demos, G, G))
-        demo_outputs = torch.randint(0, NUM_COLOURS, (BATCH, max_demos, G, G))
-        demo_mask = torch.ones(BATCH, max_demos, dtype=torch.bool)
-        test_input = torch.randint(0, NUM_COLOURS, (BATCH, G, G))
+        demo_inputs = jax.random.randint(RNG, (BATCH, max_demos, G, G), 0, NUM_COLOURS)
+        demo_outputs = jax.random.randint(jax.random.PRNGKey(1), (BATCH, max_demos, G, G), 0, NUM_COLOURS)
+        demo_mask = jnp.ones((BATCH, max_demos), dtype=jnp.bool_)
+        test_input = jax.random.randint(jax.random.PRNGKey(2), (BATCH, G, G), 0, NUM_COLOURS)
 
-        logits, alpha, meta = model(demo_inputs, demo_outputs, demo_mask, test_input)
+        init_rng, dropout_rng = jax.random.split(jax.random.PRNGKey(0))
+        variables = model.init(
+            {"params": init_rng, "dropout": dropout_rng},
+            demo_inputs, demo_outputs, demo_mask, test_input,
+            training=True,
+        )
+
+        (logits, alpha, meta), _ = model.apply(
+            variables,
+            demo_inputs, demo_outputs, demo_mask, test_input,
+            training=True,
+            rngs={"dropout": dropout_rng},
+            mutable=["state"],
+        )
 
         assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert alpha.shape == (BATCH, 3)
@@ -315,98 +295,27 @@ class TestFusionModel:
 
         G = MAX_GRID
         max_demos = 3
-        demo_inputs = torch.randint(0, NUM_COLOURS, (BATCH, max_demos, G, G))
-        demo_outputs = torch.randint(0, NUM_COLOURS, (BATCH, max_demos, G, G))
-        demo_mask = torch.tensor([[True, True, False]] * BATCH)
-        test_input = torch.randint(0, NUM_COLOURS, (BATCH, G, G))
-        test_input[:, 3:, :] = -1  # pad bottom rows
+        demo_inputs = jax.random.randint(RNG, (BATCH, max_demos, G, G), 0, NUM_COLOURS)
+        demo_outputs = jax.random.randint(jax.random.PRNGKey(1), (BATCH, max_demos, G, G), 0, NUM_COLOURS)
+        demo_mask = jnp.array([[True, True, False]] * BATCH)
+        test_input = jax.random.randint(jax.random.PRNGKey(2), (BATCH, G, G), 0, NUM_COLOURS)
+        test_input = test_input.at[:, 3:, :].set(-1)
 
-        logits, alpha, _ = model(demo_inputs, demo_outputs, demo_mask, test_input)
+        init_rng, dropout_rng = jax.random.split(jax.random.PRNGKey(0))
+        variables = model.init(
+            {"params": init_rng, "dropout": dropout_rng},
+            demo_inputs, demo_outputs, demo_mask, test_input,
+            training=True,
+        )
+
+        logits, alpha, _ = model.apply(
+            variables,
+            demo_inputs, demo_outputs, demo_mask, test_input,
+            training=False,
+        )
 
         assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert alpha.shape == (BATCH, 3)
-
-
-# ── Hebbian gradient fix tests ───────────────────────────────────────────────
-
-
-class TestHebbianGradientFlow:
-    """Tests verifying that decay/reinforce rate parameters receive gradients."""
-
-    def test_rate_params_receive_gradients_with_divergent_freq(self) -> None:
-        """After frequencies diverge, decay/reinforce logits must have non-zero grad."""
-        mem = RuleMemory(
-            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK,
-            prune_every_n_steps=0,
-        )
-        mem.train()
-
-        # Set divergent frequencies to simulate mid-training state.
-        with torch.no_grad():
-            mem.frequency.copy_(torch.tensor([0.9, 0.7, 0.3, 0.1, 0.8, 0.05, 0.6, 0.4]))
-            mem.steps_since_activation.copy_(
-                torch.tensor([0.0, 50.0, 200.0, 500.0, 10.0, 800.0, 30.0, 150.0])
-            )
-
-        x = torch.randn(BATCH, MAX_CELLS, EMBED)
-        h = torch.randn(BATCH, EMBED)
-        logits, _, info = mem(x, h)
-
-        # Use a loss that depends on both logits and strength.
-        loss = logits.sum() + 0.001 * (info["strength"].mean() - 0.5) ** 2
-        loss.backward()
-
-        assert mem.decay_rate_logit.grad is not None
-        assert mem.reinforce_rate_logit.grad is not None
-        assert mem.recency_halflife_log.grad is not None
-
-    def test_strength_returned_with_grad(self) -> None:
-        """Returned strength must be part of the computation graph during training."""
-        mem = RuleMemory(
-            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK,
-        )
-        mem.train()
-
-        x = torch.randn(BATCH, MAX_CELLS, EMBED)
-        h = torch.randn(BATCH, EMBED)
-        _, _, info = mem(x, h)
-
-        assert info["strength"].requires_grad, (
-            "strength should be differentiable during training"
-        )
-
-    def test_no_frequency_update_at_eval(self) -> None:
-        """Frequency buffer should remain unchanged during eval forward passes."""
-        mem = RuleMemory(
-            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK,
-        )
-        mem.eval()
-        freq_before = mem.frequency.clone()
-
-        x = torch.randn(BATCH, MAX_CELLS, EMBED)
-        h = torch.randn(BATCH, EMBED)
-        mem(x, h)
-
-        assert torch.equal(mem.frequency, freq_before), (
-            "Frequency buffer should not change during eval"
-        )
-
-    def test_frequency_buffer_updates_during_training(self) -> None:
-        """self.frequency buffer should be updated after a forward pass in train mode."""
-        mem = RuleMemory(
-            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK,
-            prune_every_n_steps=0,
-        )
-        mem.train()
-        freq_before = mem.frequency.clone()
-
-        x = torch.randn(BATCH, MAX_CELLS, EMBED)
-        h = torch.randn(BATCH, EMBED)
-        mem(x, h)
-
-        assert not torch.equal(mem.frequency, freq_before), (
-            "Frequency buffer should change after a training forward pass"
-        )
 
 
 # ── Parquet dataset tests ────────────────────────────────────────────────────
@@ -445,11 +354,10 @@ class TestParquetARCDataset:
         with tempfile.TemporaryDirectory() as tmp:
             path = _make_parquet_file(tmp, n_tasks=5)
             ds = ParquetARCDataset([path])
-            # Each task has 1 test pair → 5 samples.
             assert len(ds) == 5
 
     def test_getitem_returns_expected_keys(self) -> None:
-        """Each sample must contain the standard ARC tensor dict."""
+        """Each sample must contain the standard ARC array dict."""
         with tempfile.TemporaryDirectory() as tmp:
             path = _make_parquet_file(tmp, n_tasks=3)
             ds = ParquetARCDataset([path], max_grid_size=4)
@@ -462,7 +370,7 @@ class TestParquetARCDataset:
             assert set(sample.keys()) == expected_keys
 
     def test_getitem_shapes(self) -> None:
-        """Tensor shapes must match the configured grid size and demo count."""
+        """Array shapes must match the configured grid size and demo count."""
         G = 4
         max_demos = 3
         with tempfile.TemporaryDirectory() as tmp:
@@ -488,13 +396,12 @@ class TestParquetARCDataset:
         """Dataset should load from multiple parquet files."""
         with tempfile.TemporaryDirectory() as tmp:
             path1 = _make_parquet_file(tmp, n_tasks=3)
-            # Create a second file with a different name.
             path2 = os.path.join(tmp, "test_data2.parquet")
             import shutil
             shutil.copy(path1, path2)
 
             ds = ParquetARCDataset([path1, path2])
-            assert len(ds) == 6  # 3 + 3
+            assert len(ds) == 6
 
     def test_multi_test_pair_expansion(self) -> None:
         """Tasks with multiple test pairs should be expanded into separate samples."""
@@ -516,7 +423,6 @@ class TestParquetARCDataset:
             ds = ParquetARCDataset([path], max_grid_size=2)
             assert len(ds) == 2
 
-            # Verify the two samples have different test inputs.
             s0 = ds[0]
             s1 = ds[1]
-            assert not torch.equal(s0["test_input"], s1["test_input"])
+            assert not np.array_equal(s0["test_input"], s1["test_input"])

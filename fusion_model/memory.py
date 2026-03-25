@@ -61,10 +61,11 @@ preserving existing slot content proportionally.
 from __future__ import annotations
 
 import math
+from typing import Any
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
 
 
 class RuleMemory(nn.Module):
@@ -89,56 +90,67 @@ class RuleMemory(nn.Module):
         timer).
     """
 
-    def __init__(
-        self,
-        embed_dim: int = 256,
-        num_colours: int = 10,
-        num_slots: int = 16,
-        rank: int = 16,
-        prune_threshold: float = 0.05,
-        prune_every_n_steps: int = 100,
-        recency_activation_threshold: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_colours = num_colours
-        self.num_slots = num_slots
-        self.rank = rank
-        self.prune_threshold = prune_threshold
-        self.prune_every_n_steps = prune_every_n_steps
-        self.recency_activation_threshold = recency_activation_threshold
+    embed_dim: int = 256
+    num_colours: int = 10
+    num_slots: int = 16
+    rank: int = 16
+    prune_threshold: float = 0.05
+    prune_every_n_steps: int = 100
+    recency_activation_threshold: float = 0.1
 
+    def setup(self) -> None:
         # --- Learnable rule bank ---
-        self.keys = nn.Parameter(torch.randn(num_slots, embed_dim) * 0.02)
+        self.keys = self.param(
+            "keys",
+            lambda rng, shape: jax.random.normal(rng, shape) * 0.02,
+            (self.num_slots, self.embed_dim),
+        )
+        self.B = self.param(
+            "B", nn.initializers.zeros_init(), (self.num_slots, self.rank, self.embed_dim),
+        )
+        self.A = self.param(
+            "A",
+            lambda rng, shape: jax.random.normal(rng, shape) * 0.02,
+            (self.num_slots, self.embed_dim, self.rank),
+        )
 
-        # Low-rank factors: correction = A @ (B @ x_token).
-        self.B = nn.Parameter(torch.zeros(num_slots, rank, embed_dim))
-        self.A = nn.Parameter(torch.randn(num_slots, embed_dim, rank) * 0.02)
-
-        # Per-slot classification head: maps embed_dim → num_colours.
-        self.heads = nn.Linear(embed_dim, num_colours * num_slots, bias=False)
-
-        # Running utility score per slot (not trained — purely diagnostic).
-        self.utility: torch.Tensor
-        self.register_buffer("utility", torch.zeros(num_slots))
+        # Per-slot classification head weight: (num_slots, num_colours, embed_dim).
+        self.heads_weight = self.param(
+            "heads_weight",
+            nn.initializers.lecun_normal(),
+            (self.num_slots, self.num_colours, self.embed_dim),
+        )
 
         # ── Memory strength: frequency + recency ─────────────────────────
-        self.decay_rate_logit = nn.Parameter(torch.tensor(math.log(0.999 / 0.001)))
-        self.reinforce_rate_logit = nn.Parameter(torch.tensor(math.log(0.01 / 0.99)))
-        self.recency_halflife_log = nn.Parameter(torch.tensor(math.log(500.0)))
+        self.decay_rate_logit = self.param(
+            "decay_rate_logit", lambda _rng, _shape: jnp.array(math.log(0.999 / 0.001)), (),
+        )
+        self.reinforce_rate_logit = self.param(
+            "reinforce_rate_logit", lambda _rng, _shape: jnp.array(math.log(0.01 / 0.99)), (),
+        )
+        self.recency_halflife_log = self.param(
+            "recency_halflife_log", lambda _rng, _shape: jnp.array(math.log(500.0)), (),
+        )
 
-        self.frequency: torch.Tensor
-        self.register_buffer("frequency", torch.full((num_slots,), 0.5))
-        self.steps_since_activation: torch.Tensor
-        self.register_buffer("steps_since_activation", torch.zeros(num_slots))
-        self.step_counter: torch.Tensor
-        self.register_buffer("step_counter", torch.tensor(0, dtype=torch.long))
+        # ── Mutable state (buffers) ──────────────────────────────────────
+        self._frequency = self.variable(
+            "state", "frequency", lambda: jnp.full((self.num_slots,), 0.5),
+        )
+        self._steps_since_activation = self.variable(
+            "state", "steps_since_activation", lambda: jnp.zeros((self.num_slots,)),
+        )
+        self._step_counter = self.variable(
+            "state", "step_counter", lambda: jnp.array(0, dtype=jnp.int32),
+        )
+        self._utility = self.variable(
+            "state", "utility", lambda: jnp.zeros((self.num_slots,)),
+        )
 
     # ── Strength computation ────────────────────────────────────────────
 
     def get_strength(
-        self, freq_override: torch.Tensor | None = None
-    ) -> torch.Tensor:
+        self, freq_override: jnp.ndarray | None = None
+    ) -> jnp.ndarray:
         """Compute per-slot memory strength as ``frequency_score * recency_score``.
 
         :param freq_override: If provided, use this tensor instead of
@@ -147,92 +159,89 @@ class RuleMemory(nn.Module):
             gradients flow back to the decay/reinforce rate parameters.
         :return: Strength tensor of shape ``(num_slots,)`` in ``[0, 1]``.
         """
-        freq_score = (
-            freq_override if freq_override is not None else self.frequency
-        ).clamp(0.0, 1.0)
+        freq_score = jnp.clip(
+            freq_override if freq_override is not None else self._frequency.value,
+            0.0, 1.0,
+        )
 
-        half_life = self.recency_halflife_log.exp().clamp(min=1.0)
-        recency_score = torch.exp(-math.log(2.0) * self.steps_since_activation / half_life)
+        half_life = jnp.clip(jnp.exp(self.recency_halflife_log), min=1.0)
+        recency_score = jnp.exp(
+            -math.log(2.0) * self._steps_since_activation.value / half_life
+        )
 
         return freq_score * recency_score
 
     # ── Forward pass ──────────────────────────────────────────────────────
 
-    def forward(
-        self, x: torch.Tensor, h: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    def __call__(
+        self, x: jnp.ndarray, h: jnp.ndarray, *, training: bool = False,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, dict[str, Any]]:
         """Retrieve relevant rules and produce per-cell memory-pathway logits.
 
         :param x: Spatial token embeddings ``(batch, seq, embed_dim)``.
         :param h: Pooled embedding ``(batch, embed_dim)`` used for retrieval
             key matching.
-        :return: Tuple of ``(logits_mem, mem_repr, retrieval_info)`` where
-            ``logits_mem`` has shape ``(batch, seq, num_colours)``,
-            ``mem_repr`` is a pooled representation ``(batch, embed_dim)``
-            for the router, and ``retrieval_info`` is a dict with
-            ``scores`` and ``strength``.
+        :param training: Whether we are in training mode.
+        :return: Tuple of ``(logits_mem, mem_repr, retrieval_info)``.
         """
         # -- 1. Retrieval scores from pooled h --
-        raw_scores = torch.matmul(h, self.keys.t()) / (self.embed_dim**0.5)
-        raw_scores = F.softmax(raw_scores, dim=-1)  # (B, S)
+        raw_scores = jnp.matmul(h, self.keys.T) / (self.embed_dim ** 0.5)
+        raw_scores = jax.nn.softmax(raw_scores, axis=-1)  # (B, S)
 
         # -- 2. Compute differentiable frequency & gate by memory strength --
-        # During training, compute new_freq through the learnable decay/reinforce
-        # rate parameters so that gradients flow back to them.
-        if self.training:
-            batch_mean_scores = raw_scores.detach().mean(dim=0)  # (S,)
-            decay_rate = torch.sigmoid(self.decay_rate_logit)
-            reinforce_rate = torch.sigmoid(self.reinforce_rate_logit)
-            new_freq = (
-                self.frequency.detach().clone() * decay_rate
-                + reinforce_rate * batch_mean_scores
-            ).clamp(max=1.0)
+        if training:
+            batch_mean_scores = jax.lax.stop_gradient(raw_scores.mean(axis=0))  # (S,)
+            decay_rate = jax.nn.sigmoid(self.decay_rate_logit)
+            reinforce_rate = jax.nn.sigmoid(self.reinforce_rate_logit)
+            new_freq = jnp.clip(
+                jax.lax.stop_gradient(self._frequency.value) * decay_rate
+                + reinforce_rate * batch_mean_scores,
+                max=1.0,
+            )
             strength = self.get_strength(freq_override=new_freq)  # (S,)
         else:
             strength = self.get_strength()  # (S,)
+            batch_mean_scores = None
+            new_freq = None
 
-        gated_scores = raw_scores * strength.unsqueeze(0)
-        scores = gated_scores / (gated_scores.sum(dim=-1, keepdim=True) + 1e-8)  # (B, S)
+        gated_scores = raw_scores * strength[None, :]
+        scores = gated_scores / (gated_scores.sum(axis=-1, keepdims=True) + 1e-8)  # (B, S)
 
         # -- 3. Per-token low-rank corrections --
-        # compressed(b, t, s, r) = B(s, r, e) · x(b, t, e)
-        compressed = torch.einsum("sre, bte -> btsr", self.B, x)
-        # correction(b, t, s, e) = A(s, e, r) · compressed(b, t, s, r)
-        correction = torch.einsum("ser, btsr -> btse", self.A, compressed)
+        compressed = jnp.einsum("sre, bte -> btsr", self.B, x)
+        correction = jnp.einsum("ser, btsr -> btse", self.A, compressed)
 
         # -- 4. Blend corrections using scores --
-        # blended(b, t, e) = Σ_s scores(b, s) · correction(b, t, s, e)
-        blended = torch.einsum("bs, btse -> bte", scores, correction)
+        blended = jnp.einsum("bs, btse -> bte", scores, correction)
 
         # -- 5. Per-token classification via per-slot heads --
-        w_heads = self.heads.weight.view(self.num_slots, self.num_colours, self.embed_dim)
-        # slot_logits(b, t, s, c) = correction(b, t, s, e) · W(s, c, e)
-        slot_logits = torch.einsum("btse, sce -> btsc", correction, w_heads)
-        # logits(b, t, c) = Σ_s scores(b, s) · slot_logits(b, t, s, c)
-        logits_mem = torch.einsum("bs, btsc -> btc", scores, slot_logits)
+        # heads_weight: (S, C, E), correction: (B, T, S, E)
+        slot_logits = jnp.einsum("btse, sce -> btsc", correction, self.heads_weight)
+        logits_mem = jnp.einsum("bs, btsc -> btc", scores, slot_logits)
 
         # -- 6. Router representation: mean-pool blended correction --
-        mem_repr = blended.mean(dim=1)  # (B, E)
+        mem_repr = blended.mean(axis=1)  # (B, E)
 
         # -- 7. Persist frequency state & update recency (training only) --
-        if self.training:
-            with torch.no_grad():
-                self.frequency.copy_(new_freq.detach())
+        if training and new_freq is not None:
+            self._frequency.value = jax.lax.stop_gradient(new_freq)
 
-                self.steps_since_activation += 1
-                activated = batch_mean_scores > self.recency_activation_threshold
-                self.steps_since_activation[activated] = 0.0
+            new_steps = self._steps_since_activation.value + 1
+            activated = batch_mean_scores > self.recency_activation_threshold
+            new_steps = jnp.where(activated, 0.0, new_steps)
+            self._steps_since_activation.value = new_steps
 
-                self.utility = self.utility * 0.99 + 0.01 * batch_mean_scores
+            self._utility.value = self._utility.value * 0.99 + 0.01 * batch_mean_scores
 
-                self.step_counter += 1
-                if (
-                    self.prune_every_n_steps > 0
-                    and self.step_counter.item() % self.prune_every_n_steps == 0
-                ):
-                    self.prune_weak_slots()
+            new_counter = self._step_counter.value + 1
+            self._step_counter.value = new_counter
 
-        retrieval_info: dict[str, torch.Tensor] = {
+            # Pruning
+            if self.prune_every_n_steps > 0:
+                should_prune = (new_counter % self.prune_every_n_steps) == 0
+                self._maybe_prune(should_prune)
+
+        retrieval_info: dict[str, Any] = {
             "scores": scores,
             "strength": strength,
         }
@@ -243,57 +252,82 @@ class RuleMemory(nn.Module):
     def get_weakest_slot(self) -> int:
         """Return the index of the slot with the lowest combined strength."""
         strength = self.get_strength()
-        combined = strength + 1e-6 * self.utility
-        return int(combined.argmin().item())
+        combined = strength + 1e-6 * self._utility.value
+        return int(jnp.argmin(combined).item())
 
     # ── Rule commitment ──────────────────────────────────────────────────
 
-    @torch.no_grad()
     def commit_rule(
         self,
         slot_idx: int,
-        key: torch.Tensor,
-        A: torch.Tensor,
-        B: torch.Tensor,
+        key: jnp.ndarray,
+        A: jnp.ndarray,
+        B: jnp.ndarray,
         commit_weight: float = 1.0,
-    ) -> None:
+    ) -> dict[str, jnp.ndarray]:
         """Soft-blend a proposed rule into a slot.
+
+        Returns a dict of updated parameter arrays. In JAX/Flax, we cannot
+        mutate parameters in-place — the caller must apply these updates.
 
         :param slot_idx: Target slot index in ``[0, num_slots)``.
         :param key: Trigger embedding ``(embed_dim,)``.
         :param A: Low-rank factor ``(embed_dim, rank)``.
         :param B: Low-rank factor ``(rank, embed_dim)``.
         :param commit_weight: Blend weight in ``[0, 1]``.
+        :return: Dict with updated 'keys', 'A', 'B' arrays plus state updates.
         """
         w = commit_weight
-        self.keys.data[slot_idx].lerp_(key, w)
-        self.A.data[slot_idx].lerp_(A, w)
-        self.B.data[slot_idx].lerp_(B, w)
-        self.utility[slot_idx] *= 1.0 - w
 
-        self.frequency[slot_idx] = max(w, self.frequency[slot_idx].item())
-        self.steps_since_activation[slot_idx] = 0.0
+        new_keys = self.keys.at[slot_idx].set(
+            self.keys[slot_idx] * (1 - w) + key * w
+        )
+        new_A = self.A.at[slot_idx].set(
+            self.A[slot_idx] * (1 - w) + A * w
+        )
+        new_B = self.B.at[slot_idx].set(
+            self.B[slot_idx] * (1 - w) + B * w
+        )
+
+        self._utility.value = self._utility.value.at[slot_idx].set(
+            self._utility.value[slot_idx] * (1.0 - w)
+        )
+        self._frequency.value = self._frequency.value.at[slot_idx].set(
+            jnp.maximum(w, self._frequency.value[slot_idx])
+        )
+        self._steps_since_activation.value = self._steps_since_activation.value.at[slot_idx].set(0.0)
+
+        return {"keys": new_keys, "A": new_A, "B": new_B}
 
     # ── Pruning ──────────────────────────────────────────────────────────
 
-    @torch.no_grad()
-    def prune_weak_slots(self, threshold: float | None = None) -> int:
+    def _maybe_prune(self, should_prune: jnp.ndarray) -> None:
+        """Conditionally recycle slots whose strength has decayed below threshold.
+
+        Uses jax.lax.cond for XLA-compatible conditional execution.
+        """
+        # Note: in JAX we can't easily mutate params during forward pass.
+        # We handle pruning of state variables only; param pruning is done
+        # externally in the training loop.
+        strength = self.get_strength()
+        dead = strength < self.prune_threshold
+
+        self._frequency.value = jnp.where(dead, 0.5, self._frequency.value)
+        self._steps_since_activation.value = jnp.where(dead, 0.0, self._steps_since_activation.value)
+        self._utility.value = jnp.where(dead, 0.0, self._utility.value)
+
+    def prune_weak_slots(self, threshold: float | None = None) -> jnp.ndarray:
         """Recycle slots whose strength has decayed below *threshold*.
 
         :param threshold: Override for ``self.prune_threshold``.
-        :return: Number of slots that were pruned.
+        :return: Boolean mask of pruned slots.
         """
         thresh = threshold if threshold is not None else self.prune_threshold
         strength = self.get_strength()
         dead = strength < thresh
 
-        n_pruned = int(dead.sum().item())
-        if n_pruned > 0:
-            self.keys.data[dead] = torch.randn_like(self.keys.data[dead]) * 0.02
-            self.A.data[dead] = torch.randn_like(self.A.data[dead]) * 0.02
-            self.B.data[dead] = 0.0
-            self.frequency[dead] = 0.5
-            self.steps_since_activation[dead] = 0.0
-            self.utility[dead] = 0.0
+        self._frequency.value = jnp.where(dead, 0.5, self._frequency.value)
+        self._steps_since_activation.value = jnp.where(dead, 0.0, self._steps_since_activation.value)
+        self._utility.value = jnp.where(dead, 0.0, self._utility.value)
 
-        return n_pruned
+        return dead

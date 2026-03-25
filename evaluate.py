@@ -1,4 +1,4 @@
-"""Evaluation and visualisation for the Fusion Model on ARC-AGI-2.
+"""Evaluation and visualisation for the Fusion Model on ARC-AGI-2 (JAX/Flax).
 
 Run this after ``train.py`` to generate:
 
@@ -15,16 +15,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
 
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
+import jax
+import jax.numpy as jnp
 from matplotlib.colors import ListedColormap
-from torch.utils.data import DataLoader
 
 from fusion_model import FusionModel
-from tasks.arc import NUM_COLOURS, PAD_VALUE, ARCDataset
+from tasks.arc import NUM_COLOURS, PAD_VALUE, ARCDataset, data_loader
 
 matplotlib.use("Agg")
 
@@ -49,49 +50,51 @@ ARC_CMAP = ListedColormap(ARC_COLOURS)
 
 def gather_predictions(
     model: FusionModel,
-    loader: DataLoader,  # type: ignore[type-arg]
-    device: torch.device,
+    params: dict,
+    model_state: dict | None,
+    dataset: ARCDataset,
+    batch_size: int,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray]:
-    """Run inference and collect per-sample predictions.
-
-    :return: Tuple of ``(pred_grids, target_grids, input_grids, alphas)``
-        where grids are lists of 2-D arrays and alphas is ``(N, 3)``.
-    """
+    """Run inference and collect per-sample predictions."""
     all_preds: list[np.ndarray] = []
     all_targets: list[np.ndarray] = []
     all_inputs: list[np.ndarray] = []
-    all_alphas: list[torch.Tensor] = []
-    model.eval()
+    all_alphas: list[np.ndarray] = []
 
-    with torch.no_grad():
-        for batch in loader:
-            demo_inputs = batch["demo_inputs"].to(device)
-            demo_outputs = batch["demo_outputs"].to(device)
-            demo_mask = batch["demo_mask"].to(device)
-            test_input = batch["test_input"].to(device)
-            test_output = batch["test_output"]
-            output_size = batch["output_size"]
-            input_size = batch["input_size"]
+    for batch in data_loader(dataset, batch_size=batch_size, shuffle=False):
+        batch_jax = {k: jnp.array(v) for k, v in batch.items()}
 
-            logits, alphas, _ = model(demo_inputs, demo_outputs, demo_mask, test_input)
-            preds = logits.argmax(dim=-1).cpu()  # (B, max_cells)
-            all_alphas.append(alphas.cpu())
+        variables = {"params": params}
+        if model_state is not None:
+            variables["state"] = model_state
 
-            B = test_input.size(0)
-            G = test_input.size(1)
-            for i in range(B):
-                oh, ow = output_size[i].tolist()
-                ih, iw = input_size[i].tolist()
+        logits, alphas, _ = model.apply(
+            variables,
+            batch_jax["demo_inputs"],
+            batch_jax["demo_outputs"],
+            batch_jax["demo_mask"],
+            batch_jax["test_input"],
+            training=False,
+        )
 
-                pred_grid = preds[i].view(G, G)[:oh, :ow].numpy() if oh > 0 and ow > 0 else np.zeros((1, 1), dtype=int)
-                tgt_grid = test_output[i][:oh, :ow].numpy() if oh > 0 and ow > 0 else np.zeros((1, 1), dtype=int)
-                inp_grid = test_input[i].cpu()[:ih, :iw].numpy()
+        preds = np.array(logits.argmax(axis=-1))  # (B, max_cells)
+        all_alphas.append(np.array(alphas))
 
-                all_preds.append(pred_grid)
-                all_targets.append(tgt_grid)
-                all_inputs.append(inp_grid)
+        B = batch["test_input"].shape[0]
+        G = batch["test_input"].shape[1]
+        for i in range(B):
+            oh, ow = batch["output_size"][i].tolist()
+            ih, iw = batch["input_size"][i].tolist()
 
-    alphas_arr: np.ndarray = torch.cat(all_alphas).numpy()
+            pred_grid = preds[i].reshape(G, G)[:oh, :ow] if oh > 0 and ow > 0 else np.zeros((1, 1), dtype=int)
+            tgt_grid = batch["test_output"][i][:oh, :ow] if oh > 0 and ow > 0 else np.zeros((1, 1), dtype=int)
+            inp_grid = batch["test_input"][i][:ih, :iw]
+
+            all_preds.append(pred_grid)
+            all_targets.append(tgt_grid)
+            all_inputs.append(inp_grid)
+
+    alphas_arr = np.concatenate(all_alphas)
     return all_preds, all_targets, all_inputs, alphas_arr
 
 
@@ -121,9 +124,7 @@ def print_accuracy_summary(
     print(f"Task solve rate:   {solve_rate:.4f} ({tasks_solved}/{len(preds)})")
 
 
-def plot_grid(
-    ax: plt.Axes, grid: np.ndarray, title: str
-) -> None:
+def plot_grid(ax: plt.Axes, grid: np.ndarray, title: str) -> None:
     """Plot a single ARC grid on a matplotlib axis."""
     ax.imshow(grid, cmap=ARC_CMAP, vmin=0, vmax=9, interpolation="nearest")
     ax.set_title(title, fontsize=9)
@@ -199,10 +200,9 @@ def plot_training_curves(out_dir: str) -> None:
     print("Saved training_curves.png")
 
 
-def plot_rule_utility(model: FusionModel, out_dir: str) -> None:
+def plot_rule_utility(model_state: dict, out_dir: str) -> None:
     """Bar chart showing how much each memory slot is used."""
-    utility_tensor = model.memory.utility.cpu()
-    utility: np.ndarray = utility_tensor.numpy()
+    utility = np.array(model_state["memory"]["state"]["utility"])
 
     fig, ax = plt.subplots(figsize=(7, 3))
     ax.bar(range(len(utility)), utility)
@@ -220,7 +220,7 @@ def plot_rule_utility(model: FusionModel, out_dir: str) -> None:
 
 def main() -> None:
     """Load the best model, run evaluation, and generate all plots."""
-    parser = argparse.ArgumentParser(description="Evaluate Fusion Model on ARC-AGI-2")
+    parser = argparse.ArgumentParser(description="Evaluate Fusion Model on ARC-AGI-2 (JAX)")
     parser.add_argument("--data_root", type=str, default="data")
     parser.add_argument("--out_dir", type=str, default="outputs")
     parser.add_argument("--batch_size", type=int, default=4)
@@ -228,16 +228,9 @@ def main() -> None:
     parser.add_argument("--max_grid_size", type=int, default=30)
     parser.add_argument("--max_demos", type=int, default=5)
     parser.add_argument("--embed_dim", type=int, default=256)
-    parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
 
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
-    )
+    print(f"JAX devices: {jax.devices()}")
 
     # ── Build dataset ────────────────────────────────────────────────────
     eval_dir = os.path.join(args.data_root, "evaluation")
@@ -247,25 +240,25 @@ def main() -> None:
         max_demos=args.max_demos,
         max_samples=args.max_samples,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-    )
 
     # ── Load trained model ───────────────────────────────────────────────
     model = FusionModel(
         embed_dim=args.embed_dim,
         num_colours=NUM_COLOURS,
         max_grid_size=args.max_grid_size,
-    ).to(device)
-    ckpt_path = os.path.join(args.out_dir, "fusion_best.pt")
-    model.load_state_dict(torch.load(ckpt_path, weights_only=True, map_location=device))
+    )
+
+    ckpt_path = os.path.join(args.out_dir, "fusion_best.pkl")
+    with open(ckpt_path, "rb") as f:
+        ckpt = pickle.load(f)
+    params = ckpt["params"]
+    model_state = ckpt.get("model_state")
     print(f"Loaded weights from {ckpt_path}")
 
     # ── Predictions ──────────────────────────────────────────────────────
-    preds, targets, inputs, alphas = gather_predictions(model, val_loader, device)
+    preds, targets, inputs, alphas = gather_predictions(
+        model, params, model_state, val_ds, args.batch_size,
+    )
 
     # ── 1. Accuracy summary ──────────────────────────────────────────────
     print_accuracy_summary(preds, targets)
@@ -280,7 +273,8 @@ def main() -> None:
     plot_training_curves(args.out_dir)
 
     # ── 5. Rule utility ──────────────────────────────────────────────────
-    plot_rule_utility(model, args.out_dir)
+    if model_state is not None:
+        plot_rule_utility(model_state, args.out_dir)
 
     print(f"\nAll plots saved to {args.out_dir}/")
 
