@@ -56,6 +56,70 @@ def count_params(params: Any) -> int:
 # ── Data prefetching ─────────────────────────────────────────────────────────
 
 
+def _shard_batch(
+    batch: dict[str, np.ndarray],
+    data_sharding: NamedSharding,
+) -> dict[str, jax.Array]:
+    """Create globally-sharded arrays from a numpy batch (multi-host safe).
+
+    Each host takes its slice of the global batch and places the sub-slices
+    on its local devices.  No cross-host data transfer is needed — only
+    the metadata (shape + sharding) is shared.
+    """
+    num_processes = jax.process_count()
+    process_index = jax.process_index()
+    local_devices = jax.local_devices()
+    num_local = len(local_devices)
+
+    num_devices = num_processes * num_local
+    result = {}
+    for k, v in batch.items():
+        global_bs = v.shape[0]
+
+        # Pad incomplete batches so they're divisible across all devices.
+        if global_bs % num_devices != 0:
+            padded_bs = ((global_bs + num_devices - 1) // num_devices) * num_devices
+            pad_widths = [(0, padded_bs - global_bs)] + [(0, 0)] * (v.ndim - 1)
+            v = np.pad(v, pad_widths, mode="constant", constant_values=0)
+        else:
+            padded_bs = global_bs
+
+        local_bs = padded_bs // num_processes
+        start = process_index * local_bs
+        end = start + local_bs
+        local_data = v[start:end]
+
+        per_device = np.split(local_data, num_local)
+        local_arrays = [
+            jax.device_put(jnp.array(chunk), device)
+            for chunk, device in zip(per_device, local_devices)
+        ]
+        global_shape = (padded_bs, *v.shape[1:])
+        result[k] = jax.make_array_from_single_device_arrays(
+            global_shape, data_sharding, local_arrays
+        )
+    return result
+
+
+def _replicate_state(
+    state: Any,
+    replicated: NamedSharding,
+) -> Any:
+    """Replicate train state across all devices (multi-host safe)."""
+    local_devices = jax.local_devices()
+
+    def _replicate(x):
+        if isinstance(x, (np.ndarray, jnp.ndarray, jax.Array)):
+            arr = np.asarray(x)
+            local_arrays = [jax.device_put(jnp.array(arr), d) for d in local_devices]
+            return jax.make_array_from_single_device_arrays(
+                arr.shape, replicated, local_arrays
+            )
+        return x
+
+    return jax.tree.map(_replicate, state)
+
+
 def prefetch_to_device(
     iterator,
     prefetch_size: int = 2,
@@ -64,14 +128,14 @@ def prefetch_to_device(
     """Prefetch batches to device(s) in a background thread.
 
     Overlaps host→device transfer and data loading with accelerator compute
-    so neither blocks the other.  When *data_sharding* is provided each
-    batch array is placed on the mesh with the given sharding (typically
-    sharded along the batch dimension for data parallelism).
+    so neither blocks the other.  When *data_sharding* is provided, arrays
+    are sharded across the mesh using :func:`_shard_batch` which is safe
+    for multi-host TPU pods.
 
     :param iterator: An iterable yielding dicts of numpy arrays.
     :param prefetch_size: How many batches to buffer ahead.
     :param data_sharding: Optional sharding for multi-device data parallelism.
-    :yields: Dicts of jnp arrays already on device.
+    :yields: Dicts of jnp/jax arrays already on device.
     """
     q: queue.Queue = queue.Queue(maxsize=prefetch_size)
     sentinel = object()
@@ -79,9 +143,10 @@ def prefetch_to_device(
     def _producer():
         try:
             for batch in iterator:
-                batch_jax = {k: jnp.array(v) for k, v in batch.items()}
                 if data_sharding is not None:
-                    batch_jax = jax.device_put(batch_jax, data_sharding)
+                    batch_jax = _shard_batch(batch, data_sharding)
+                else:
+                    batch_jax = {k: jnp.array(v) for k, v in batch.items()}
                 q.put(batch_jax)
         finally:
             q.put(sentinel)
@@ -291,12 +356,14 @@ def train_fusion(
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             patience_counter = 0
-            ckpt = {
-                "params": jax.device_get(state.params),
-                "model_state": jax.device_get(state.model_state),
-            }
-            with open(os.path.join(args.out_dir, "fusion_best.pkl"), "wb") as f:
-                pickle.dump(ckpt, f)
+            # Only process 0 saves checkpoints in multi-host setups.
+            if jax.process_index() == 0:
+                ckpt = {
+                    "params": jax.device_get(state.params),
+                    "model_state": jax.device_get(state.model_state),
+                }
+                with open(os.path.join(args.out_dir, "fusion_best.pkl"), "wb") as f:
+                    pickle.dump(ckpt, f)
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
@@ -352,7 +419,8 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
 
     # ── Multi-device mesh setup ────────────────────────────────────────
-    num_devices = len(jax.devices())
+    num_devices = jax.device_count()          # total across all hosts
+    num_processes = jax.process_count()       # number of hosts
     mesh = Mesh(np.array(jax.devices()), axis_names=("data",))
     data_sharding = NamedSharding(mesh, P("data"))
     replicated = NamedSharding(mesh, P())
@@ -360,7 +428,7 @@ def main() -> None:
     print(f"JAX devices: {jax.devices()}")
     print(f"JAX backend: {jax.default_backend()}")
     if num_devices > 1:
-        print(f"Data parallelism: {num_devices} devices")
+        print(f"Data parallelism: {num_devices} devices across {num_processes} host(s)")
 
     # Batch size must be divisible by the number of devices.
     if args.batch_size % num_devices != 0:
@@ -472,16 +540,17 @@ def main() -> None:
         rng=rng,
     )
 
-    # Replicate state across all devices for data parallelism.
-    state = jax.device_put(state, replicated)
+    # Replicate state across all devices for data parallelism (multi-host safe).
+    state = _replicate_state(state, replicated)
 
     print("Training... (first step will be slow due to JIT compilation)")
     state, history = train_fusion(state, train_ds, val_ds, args, data_sharding=data_sharding)
 
-    history_path = os.path.join(args.out_dir, "fusion_history.json")
-    with open(history_path, "w", encoding="utf-8") as fh:
-        json.dump(history, fh)
-    print(f"History saved to {history_path}")
+    if jax.process_index() == 0:
+        history_path = os.path.join(args.out_dir, "fusion_history.json")
+        with open(history_path, "w", encoding="utf-8") as fh:
+            json.dump(history, fh)
+        print(f"History saved to {history_path}")
 
 
 if __name__ == "__main__":
