@@ -168,40 +168,43 @@ class RuleGenerator(nn.Module):
 
     # ── Rule proposal ────────────────────────────────────────────────────
 
-    def propose_rule(self, batch_size: int) -> dict[str, jnp.ndarray] | None:
+    def propose_rule(self, batch_size: int) -> dict[str, jnp.ndarray]:
         """Propose a persistent rule from historical context only.
 
-        Returns ``None`` when the history buffer has fewer than
-        ``min_history`` entries.
+        Always returns a proposal dict (never ``None``) so the function
+        is compatible with ``jax.jit``.  When the history buffer has fewer
+        than ``min_history`` entries the ``commit_weight`` is zeroed out,
+        effectively disabling the proposal without a data-dependent branch.
         """
         count = self._history_count.value
-        count_val = count.item() if hasattr(count, 'item') else int(count)
-        if count_val < self.min_history:
-            return None
+        n = self.history_size
 
-        history_h = self._history_h.value
-        history_decisions = self._history_decisions.value
-        history_outcomes = self._history_outcomes.value
+        history_h = self._history_h.value              # (n, embed_dim)
+        history_decisions = self._history_decisions.value  # (n,)
+        history_outcomes = self._history_outcomes.value    # (n,)
 
-        valid_h = history_h[:count_val]
-        valid_dec = history_decisions[:count_val]
-        valid_out = history_outcomes[:count_val]
+        # Mask invalid (unfilled) buffer slots.
+        valid_mask = jnp.arange(n) < count              # (n,)
+        history_h = history_h * valid_mask[:, None]
+        # Replace -1 sentinel in unfilled decision slots with 0 (valid embed index).
+        history_decisions = jnp.where(valid_mask, history_decisions, 0)
+        history_outcomes = history_outcomes * valid_mask
 
         hist_h = jnp.broadcast_to(
-            valid_h[None, :, :], (batch_size, count_val, self.embed_dim),
+            history_h[None, :, :], (batch_size, n, self.embed_dim),
         )
 
         # Stage 1: historical inputs cross-attend over historical decisions.
-        dec_emb = self.dec_proj(self.decision_embed(valid_dec))
+        dec_emb = self.dec_proj(self.decision_embed(history_decisions))
         kv_dec = jnp.broadcast_to(
-            dec_emb[None, :, :], (batch_size, count_val, self.embed_dim),
+            dec_emb[None, :, :], (batch_size, n, self.embed_dim),
         )
         attended_input_dec = self.input_dec_cross_attn(hist_h, kv_dec)
 
         # Stage 2: input→decision result cross-attends over outcome embeddings.
-        outcome_emb = self.outcome_proj(valid_out[:, None])
+        outcome_emb = self.outcome_proj(history_outcomes[:, None])
         kv_out = jnp.broadcast_to(
-            outcome_emb[None, :, :], (batch_size, count_val, self.embed_dim),
+            outcome_emb[None, :, :], (batch_size, n, self.embed_dim),
         )
         attended_outcome = self.outcome_cross_attn(attended_input_dec, kv_out)
 
@@ -226,7 +229,7 @@ class RuleGenerator(nn.Module):
         A = a_flat.reshape(-1, e, r)
         B = b_flat.reshape(-1, r, e)
 
-        mean_hist = valid_h.mean(axis=0, keepdims=True)
+        mean_hist = history_h.mean(axis=0, keepdims=True)
         mean_hist = jnp.broadcast_to(mean_hist, (batch_size, e))
         # Cosine similarity.
         similarity = (
@@ -239,6 +242,10 @@ class RuleGenerator(nn.Module):
             (similarity - threshold) * temperature,
         )[:, None]
 
+        # Zero out commit_weight when history is insufficient.
+        has_enough = (count >= self.min_history).astype(jnp.float32)
+        commit_weight = commit_weight * has_enough
+
         return {
             "key": key,
             "A": A,
@@ -250,7 +257,7 @@ class RuleGenerator(nn.Module):
 
     def __call__(
         self, x: jnp.ndarray, h: jnp.ndarray, *, training: bool = False,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, dict[str, jnp.ndarray] | None]:
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, dict[str, jnp.ndarray]]:
         """Produce per-token ephemeral rule logits, confidence, repr, and a rule proposal.
 
         :param x: Spatial token embeddings ``(batch, seq, embed_dim)``.

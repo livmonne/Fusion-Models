@@ -149,11 +149,12 @@ class TestRuleGenerator:
         _, confidence, _, _ = _apply_module(gen, variables, x, h)
         assert (confidence >= 0.0).all() and (confidence <= 1.0).all()
 
-    def test_proposal_none_before_min_history(self) -> None:
-        """propose_rule must return None when history is below min_history."""
+    def test_proposal_disabled_before_min_history(self) -> None:
+        """commit_weight must be zero when history is below min_history."""
         gen, variables, x, h = self._make_gen(min_history=64)
         _, _, _, proposal = _apply_module(gen, variables, x, h)
-        assert proposal is None
+        assert proposal is not None
+        assert float(proposal["commit_weight"].sum()) == 0.0
 
 
 class TestGuessComponent:
