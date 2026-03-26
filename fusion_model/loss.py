@@ -69,7 +69,8 @@ def fusion_loss(
     :param alphas: Routing weights ``(batch, 3)``.
     :param retrieval_scores: Memory retrieval scores ``(batch, num_slots)``.
     :param metadata: Dict with per-pathway logits and other info.
-    :return: Tuple of ``(total_loss, loss_dict)``.
+    :return: Tuple of ``(total_loss, loss_dict)`` where loss_dict values are
+        raw jnp scalars (JIT-compatible). Convert to float outside JIT.
     """
     B, S, C = logits.shape
 
@@ -129,14 +130,14 @@ def fusion_loss(
         + lambda_strength * strength_reg
     )
 
-    loss_dict: dict[str, float] = {
-        "total": float(total_loss),
-        "task": float(task_loss),
-        "guess_penalty": float(guess_penalty),
-        "storage_cost": float(storage_cost),
-        "entropy": float(entropy),
-        "aux": float(aux_loss),
-        "commit_reg": float(commit_reg),
-        "strength_reg": float(strength_reg),
+    loss_dict = {
+        "total": total_loss,
+        "task": task_loss,
+        "guess_penalty": guess_penalty,
+        "storage_cost": storage_cost,
+        "entropy": entropy,
+        "aux": aux_loss,
+        "commit_reg": commit_reg,
+        "strength_reg": strength_reg,
     }
     return total_loss, loss_dict

@@ -4,7 +4,7 @@ Usage::
 
     python train.py --data_root data --epochs 40
     python train.py --parquet_dir /path/to/parquets --epochs 40
-    python train.py --parquet_files a.parquet b.parquet --epochs 40
+    python train.py --parquet_dir data --data_root data --epochs 40
 
 The script:
 
@@ -21,7 +21,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
+import queue
 import sys
+import threading
 from functools import partial
 from typing import Any
 
@@ -38,7 +41,6 @@ from tasks.arc import (
     PAD_VALUE,
     ARCDataset,
     ParquetARCDataset,
-    collate_batch,
     data_loader,
 )
 
@@ -50,17 +52,40 @@ def count_params(params: Any) -> int:
     return sum(x.size for x in jax.tree.leaves(params))
 
 
-def compute_cell_accuracy(
-    logits: jnp.ndarray,
-    targets: jnp.ndarray,
-    pad_value: int = PAD_VALUE,
-) -> tuple[int, int]:
-    """Compute per-cell accuracy ignoring padded positions."""
-    preds = logits.argmax(axis=-1)
-    valid = targets != pad_value
-    correct = int(((preds == targets) & valid).sum())
-    total = int(valid.sum())
-    return correct, total
+# ── Data prefetching ─────────────────────────────────────────────────────────
+
+
+def prefetch_to_device(
+    iterator, prefetch_size: int = 2,
+):
+    """Prefetch batches to device in a background thread.
+
+    Overlaps host→device transfer and data loading with accelerator compute
+    so neither blocks the other.
+
+    :param iterator: An iterable yielding dicts of numpy arrays.
+    :param prefetch_size: How many batches to buffer ahead.
+    :yields: Dicts of jnp arrays already on device.
+    """
+    q: queue.Queue = queue.Queue(maxsize=prefetch_size)
+    sentinel = object()
+
+    def _producer():
+        try:
+            for batch in iterator:
+                batch_jax = {k: jnp.array(v) for k, v in batch.items()}
+                q.put(batch_jax)
+        finally:
+            q.put(sentinel)
+
+    thread = threading.Thread(target=_producer, daemon=True)
+    thread.start()
+
+    while True:
+        item = q.get()
+        if item is sentinel:
+            break
+        yield item
 
 
 # ── Train state ──────────────────────────────────────────────────────────────
@@ -72,20 +97,19 @@ class FusionTrainState(train_state.TrainState):
     rng: jax.Array = None
 
 
-# ── Training step ────────────────────────────────────────────────────────────
+# ── Training step (JIT-compiled) ─────────────────────────────────────────────
 
 
+@partial(jax.jit, donate_argnums=(0,))
 def train_step(
     state: FusionTrainState,
     batch: dict[str, jnp.ndarray],
-    pad_value: int = PAD_VALUE,
 ) -> tuple[FusionTrainState, dict[str, Any]]:
-    """Execute one training step.
+    """Execute one JIT-compiled training step.
 
     :param state: Current training state (params, optimizer, model_state).
     :param batch: Dict of batched arrays from the data loader.
-    :param pad_value: Padding value for targets.
-    :return: Updated state and metrics dict.
+    :return: Updated state and metrics dict (jnp scalars).
     """
     rng, dropout_rng = jax.random.split(state.rng)
 
@@ -114,7 +138,7 @@ def train_step(
             logits, targets_flat, alphas,
             meta["retrieval_scores"],
             metadata=meta,
-            pad_value=pad_value,
+            pad_value=PAD_VALUE,
         )
 
         return total_loss, (loss_dict, logits, alphas, targets_flat, mutated)
@@ -122,18 +146,16 @@ def train_step(
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, (loss_dict, logits, alphas, targets_flat, mutated)), grads = grad_fn(state.params)
 
-    # Clip gradients.
-    grads = optax.clip_by_global_norm(1.0).update(grads, state.opt_state)[0]
-
+    # Grad clipping is handled by the optimizer chain — no manual clip here.
     state = state.apply_gradients(grads=grads)
     state = state.replace(
         model_state=mutated.get("state"),
         rng=rng,
     )
 
-    # Compute accuracy.
+    # Compute accuracy (stays as jnp scalars inside JIT).
     preds = logits.argmax(axis=-1)
-    valid = targets_flat != pad_value
+    valid = targets_flat != PAD_VALUE
     correct = ((preds == targets_flat) & valid).sum()
     total = valid.sum()
 
@@ -142,20 +164,19 @@ def train_step(
         "correct": correct,
         "total": total,
         "alphas": alphas.mean(axis=0),
-        **{k: v for k, v in loss_dict.items()},
     }
     return state, metrics
 
 
-# ── Evaluation step ──────────────────────────────────────────────────────────
+# ── Evaluation step (JIT-compiled) ───────────────────────────────────────────
 
 
+@jax.jit
 def eval_step(
     state: FusionTrainState,
     batch: dict[str, jnp.ndarray],
-    pad_value: int = PAD_VALUE,
-) -> tuple[int, int]:
-    """Execute one evaluation step (no gradients)."""
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Execute one JIT-compiled evaluation step (no gradients)."""
     variables = {"params": state.params}
     if state.model_state is not None:
         variables["state"] = state.model_state
@@ -174,18 +195,23 @@ def eval_step(
     max_cells = logits.shape[1]
     targets_flat = targets_flat[:, :max_cells]
 
-    return compute_cell_accuracy(logits, targets_flat, pad_value)
+    preds = logits.argmax(axis=-1)
+    valid = targets_flat != PAD_VALUE
+    correct = ((preds == targets_flat) & valid).sum()
+    total = valid.sum()
+
+    return correct, total
 
 
 def evaluate(state: FusionTrainState, dataset: Any, batch_size: int) -> float:
     """Compute per-cell accuracy on a dataset."""
     correct = 0
     total = 0
-    for batch in data_loader(dataset, batch_size=batch_size, shuffle=False):
-        batch_jax = {k: jnp.array(v) for k, v in batch.items()}
+    loader = data_loader(dataset, batch_size=batch_size, shuffle=False)
+    for batch_jax in prefetch_to_device(loader):
         c, t = eval_step(state, batch_jax)
-        correct += c
-        total += t
+        correct += int(c)
+        total += int(t)
     return correct / total if total > 0 else 0.0
 
 
@@ -215,17 +241,17 @@ def train_fusion(
         epoch_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
-        step = 0
 
-        for batch in data_loader(train_ds, batch_size=args.batch_size, shuffle=True, rng=rng):
-            batch_jax = {k: jnp.array(v) for k, v in batch.items()}
+        loader = data_loader(train_ds, batch_size=args.batch_size, shuffle=True, rng=rng)
+        last_alphas = None
+        for batch_jax in prefetch_to_device(loader):
             state, metrics = train_step(state, batch_jax)
 
             B = batch_jax["test_output"].shape[0]
             epoch_loss += float(metrics["loss"]) * B
             epoch_correct += int(metrics["correct"])
             epoch_total += int(metrics["total"])
-            step += 1
+            last_alphas = metrics["alphas"]
 
         train_loss = epoch_loss / max(epoch_total, 1)
         train_acc = epoch_correct / max(epoch_total, 1)
@@ -235,21 +261,22 @@ def train_fusion(
         history["train_acc"].append(train_acc)
         history["val_acc"].append(val_acc)
 
-        alpha_mean = metrics["alphas"]
+        alpha_str = ""
+        if last_alphas is not None:
+            alpha_str = (
+                f"  alpha(mem={float(last_alphas[0]):.3f}  "
+                f"rule={float(last_alphas[1]):.3f}  "
+                f"guess={float(last_alphas[2]):.3f})"
+            )
         print(
             f"Epoch {epoch:3d}/{args.epochs}  "
             f"loss={train_loss:.4f}  train_acc={train_acc:.3f}  "
-            f"val_acc={val_acc:.3f}  "
-            f"alpha(mem={float(alpha_mean[0]):.3f}  "
-            f"rule={float(alpha_mean[1]):.3f}  "
-            f"guess={float(alpha_mean[2]):.3f})"
+            f"val_acc={val_acc:.3f}{alpha_str}"
         )
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             patience_counter = 0
-            # Save checkpoint.
-            import pickle
             ckpt = {
                 "params": jax.device_get(state.params),
                 "model_state": jax.device_get(state.model_state),
@@ -367,7 +394,7 @@ def main() -> None:
     rng, init_rng, dropout_rng = jax.random.split(rng, 3)
 
     G = args.max_grid_size
-    D = args.max_demos if hasattr(args, "max_demos") else 5
+    D = args.max_demos
     dummy_batch = {
         "demo_inputs": jnp.zeros((1, D, G, G), dtype=jnp.int32),
         "demo_outputs": jnp.zeros((1, D, G, G), dtype=jnp.int32),
@@ -388,7 +415,7 @@ def main() -> None:
 
     print(f"Fusion Model: {count_params(params):,} trainable parameters")
 
-    # ── Optimizer: AdamW + linear warmup + cosine decay ──────────────────
+    # ── Optimizer: AdamW + grad clipping + linear warmup + cosine decay ──
     warmup_epochs = min(5, args.epochs // 4)
     total_steps = args.epochs * (len(train_ds) // args.batch_size + 1)
     warmup_steps = warmup_epochs * (len(train_ds) // args.batch_size + 1)
@@ -414,7 +441,7 @@ def main() -> None:
         rng=rng,
     )
 
-    print("Training...")
+    print("Training... (first step will be slow due to JIT compilation)")
     state, history = train_fusion(state, train_ds, val_ds, args)
 
     history_path = os.path.join(args.out_dir, "fusion_history.json")
