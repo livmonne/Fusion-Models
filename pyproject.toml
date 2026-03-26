@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 tpu = [
     "jax[tpu]",
+    "libtpu",
 ]
 dev = [
     "ruff",
