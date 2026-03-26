@@ -33,6 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax.training import train_state
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from fusion_model import FusionModel
 from fusion_model.loss import fusion_loss
@@ -56,15 +57,20 @@ def count_params(params: Any) -> int:
 
 
 def prefetch_to_device(
-    iterator, prefetch_size: int = 2,
+    iterator,
+    prefetch_size: int = 2,
+    data_sharding: NamedSharding | None = None,
 ):
-    """Prefetch batches to device in a background thread.
+    """Prefetch batches to device(s) in a background thread.
 
     Overlaps host→device transfer and data loading with accelerator compute
-    so neither blocks the other.
+    so neither blocks the other.  When *data_sharding* is provided each
+    batch array is placed on the mesh with the given sharding (typically
+    sharded along the batch dimension for data parallelism).
 
     :param iterator: An iterable yielding dicts of numpy arrays.
     :param prefetch_size: How many batches to buffer ahead.
+    :param data_sharding: Optional sharding for multi-device data parallelism.
     :yields: Dicts of jnp arrays already on device.
     """
     q: queue.Queue = queue.Queue(maxsize=prefetch_size)
@@ -74,6 +80,8 @@ def prefetch_to_device(
         try:
             for batch in iterator:
                 batch_jax = {k: jnp.array(v) for k, v in batch.items()}
+                if data_sharding is not None:
+                    batch_jax = jax.device_put(batch_jax, data_sharding)
                 q.put(batch_jax)
         finally:
             q.put(sentinel)
@@ -203,12 +211,17 @@ def eval_step(
     return correct, total
 
 
-def evaluate(state: FusionTrainState, dataset: Any, batch_size: int) -> float:
+def evaluate(
+    state: FusionTrainState,
+    dataset: Any,
+    batch_size: int,
+    data_sharding: NamedSharding | None = None,
+) -> float:
     """Compute per-cell accuracy on a dataset."""
     correct = 0
     total = 0
     loader = data_loader(dataset, batch_size=batch_size, shuffle=False)
-    for batch_jax in prefetch_to_device(loader):
+    for batch_jax in prefetch_to_device(loader, data_sharding=data_sharding):
         c, t = eval_step(state, batch_jax)
         correct += int(c)
         total += int(t)
@@ -223,6 +236,7 @@ def train_fusion(
     train_ds: Any,
     val_ds: Any,
     args: argparse.Namespace,
+    data_sharding: NamedSharding | None = None,
 ) -> tuple[FusionTrainState, dict[str, list[float]]]:
     """Run the full training loop for the Fusion Model."""
     best_val_acc = 0.0
@@ -244,7 +258,7 @@ def train_fusion(
 
         loader = data_loader(train_ds, batch_size=args.batch_size, shuffle=True, rng=rng)
         last_alphas = None
-        for batch_jax in prefetch_to_device(loader):
+        for batch_jax in prefetch_to_device(loader, data_sharding=data_sharding):
             state, metrics = train_step(state, batch_jax)
 
             B = batch_jax["test_output"].shape[0]
@@ -255,7 +269,7 @@ def train_fusion(
 
         train_loss = epoch_loss / max(epoch_total, 1)
         train_acc = epoch_correct / max(epoch_total, 1)
-        val_acc = evaluate(state, val_ds, args.batch_size)
+        val_acc = evaluate(state, val_ds, args.batch_size, data_sharding=data_sharding)
 
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
@@ -337,8 +351,25 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # ── Multi-device mesh setup ────────────────────────────────────────
+    num_devices = len(jax.devices())
+    mesh = Mesh(np.array(jax.devices()), axis_names=("data",))
+    data_sharding = NamedSharding(mesh, P("data"))
+    replicated = NamedSharding(mesh, P())
+
     print(f"JAX devices: {jax.devices()}")
     print(f"JAX backend: {jax.default_backend()}")
+    if num_devices > 1:
+        print(f"Data parallelism: {num_devices} devices")
+
+    # Batch size must be divisible by the number of devices.
+    if args.batch_size % num_devices != 0:
+        new_bs = max(num_devices, ((args.batch_size + num_devices - 1) // num_devices) * num_devices)
+        print(f"Adjusting --batch_size {args.batch_size} → {new_bs} (divisible by {num_devices} devices)")
+        args.batch_size = new_bs
+        # Re-validate grad_accum after adjustment.
+        if args.grad_accum % args.batch_size != 0:
+            args.grad_accum = args.batch_size
 
     # ── Construct datasets ───────────────────────────────────────────────
     parquet_paths: list[str] | None = None
@@ -441,8 +472,11 @@ def main() -> None:
         rng=rng,
     )
 
+    # Replicate state across all devices for data parallelism.
+    state = jax.device_put(state, replicated)
+
     print("Training... (first step will be slow due to JIT compilation)")
-    state, history = train_fusion(state, train_ds, val_ds, args)
+    state, history = train_fusion(state, train_ds, val_ds, args, data_sharding=data_sharding)
 
     history_path = os.path.join(args.out_dir, "fusion_history.json")
     with open(history_path, "w", encoding="utf-8") as fh:
