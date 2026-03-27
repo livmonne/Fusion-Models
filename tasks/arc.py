@@ -239,6 +239,67 @@ class ARCDataset(_BaseARCDataset):
 # ── Parquet dataset ──────────────────────────────────────────────────────────
 
 
+class ChallengesDataset(_BaseARCDataset):
+    """Dataset for a single Kaggle challenges JSON file.
+
+    The Kaggle ARC-AGI-2 evaluation challenges are distributed as one JSON
+    file mapping task IDs to ``{"train": [...], "test": [{"input": ...}]}``.
+    Ground-truth outputs are not available, so ``test_output`` is always
+    ``None``.
+
+    Each test pair is expanded into a separate sample (matching
+    :class:`ARCDataset` behaviour).  The ``task_id`` (string) and
+    ``test_pair_idx`` (int) are included in the dict returned by
+    ``__getitem__`` so that results can be grouped back by task.
+
+    :param challenges_path: Path to the challenges JSON file.
+    :param max_grid_size: Pad all grids to this square size.
+    :param max_demos: Maximum number of demonstration pairs to include.
+    :param max_samples: If set, only load this many samples (for debugging).
+    """
+
+    def __init__(
+        self,
+        challenges_path: str,
+        max_grid_size: int = MAX_GRID_SIZE,
+        max_demos: int = 5,
+        max_samples: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.max_grid_size = max_grid_size
+        self.max_demos = max_demos
+
+        self.samples: list[dict[str, Any]] = []
+        self._load_challenges(challenges_path, max_samples)
+
+    def _load_challenges(
+        self, challenges_path: str, max_samples: int | None
+    ) -> None:
+        """Parse the challenges JSON and build the sample list."""
+        with open(challenges_path, encoding="utf-8") as fh:
+            challenges: dict[str, Any] = json.load(fh)
+
+        for task_id in sorted(challenges):
+            task = challenges[task_id]
+            demos = task["train"]
+            for tp_idx, test_pair in enumerate(task["test"]):
+                self.samples.append({
+                    "task_id": task_id,
+                    "test_pair_idx": tp_idx,
+                    "demos": demos,
+                    "test_input": test_pair["input"],
+                    "test_output": test_pair.get("output"),
+                })
+                if max_samples is not None and len(self.samples) >= max_samples:
+                    return
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        result: dict[str, Any] = super().__getitem__(idx)
+        result["task_id"] = self.samples[idx]["task_id"]
+        result["test_pair_idx"] = self.samples[idx]["test_pair_idx"]
+        return result
+
+
 class ParquetARCDataset(_BaseARCDataset):
     """PyTorch dataset that lazily loads ARC tasks from ``.parquet`` files.
 
