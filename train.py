@@ -302,12 +302,22 @@ def train_fusion(
     val_ds: Any,
     args: argparse.Namespace,
     data_sharding: NamedSharding | None = None,
+    *,
+    start_epoch: int = 1,
+    resume_state: dict | None = None,
 ) -> tuple[FusionTrainState, dict[str, list[float]]]:
     """Run the full training loop for the Fusion Model."""
-    best_val_acc = 0.0
-    patience_counter = 0
-    history: dict[str, list[float]] = {"train_loss": [], "train_acc": [], "val_acc": []}
-    rng = np.random.default_rng(args.seed)
+    if resume_state is not None:
+        best_val_acc = resume_state["best_val_acc"]
+        patience_counter = resume_state["patience_counter"]
+        history = resume_state["history"]
+        rng = np.random.default_rng()
+        rng.bit_generator.state = resume_state["np_rng_state"]
+    else:
+        best_val_acc = 0.0
+        patience_counter = 0
+        history = {"train_loss": [], "train_acc": [], "val_acc": []}
+        rng = np.random.default_rng(args.seed)
 
     accum_steps = args.grad_accum // args.batch_size
 
@@ -316,7 +326,7 @@ def train_fusion(
         f"(micro={args.batch_size} x accum={accum_steps})"
     )
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         epoch_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
@@ -352,6 +362,31 @@ def train_fusion(
             f"loss={train_loss:.4f}  train_acc={train_acc:.3f}  "
             f"val_acc={val_acc:.3f}{alpha_str}"
         )
+
+        # ── Periodic checkpoint ───────────────────────────────────────
+        if jax.process_index() == 0 and epoch % args.ckpt_every == 0:
+            ckpt_full = {
+                "params": jax.device_get(state.params),
+                "model_state": jax.device_get(state.model_state),
+                "opt_state": jax.device_get(state.opt_state),
+                "step": int(state.step),
+                "rng": jax.device_get(state.rng),
+                "epoch": epoch,
+                "best_val_acc": best_val_acc,
+                "patience_counter": patience_counter,
+                "history": history,
+                "np_rng_state": rng.bit_generator.state,
+                "args": vars(args),
+            }
+            ckpt_path = os.path.join(args.out_dir, f"checkpoint_epoch_{epoch:04d}.pkl")
+            latest_path = os.path.join(args.out_dir, "checkpoint_latest.pkl")
+            with open(ckpt_path, "wb") as f:
+                pickle.dump(ckpt_full, f)
+            tmp_path = latest_path + ".tmp"
+            with open(tmp_path, "wb") as f:
+                pickle.dump(ckpt_full, f)
+            os.replace(tmp_path, latest_path)
+            print(f"  Checkpoint saved: {ckpt_path}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -392,6 +427,14 @@ def main() -> None:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--out_dir", type=str, default="outputs")
+    parser.add_argument(
+        "--resume", type=str, default=None, metavar="PATH",
+        help="Path to a checkpoint file to resume training from.",
+    )
+    parser.add_argument(
+        "--ckpt_every", type=int, default=1,
+        help="Save a full checkpoint every N epochs (default: every epoch).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--max_grid_size", type=int, default=30)
@@ -540,11 +583,51 @@ def main() -> None:
         rng=rng,
     )
 
+    # ── Resume from checkpoint ────────────────────────────────────────
+    start_epoch = 1
+    resume_state = None
+
+    if args.resume is not None:
+        print(f"Resuming from checkpoint: {args.resume}")
+        with open(args.resume, "rb") as f:
+            ckpt = pickle.load(f)
+
+        saved_args = ckpt.get("args", {})
+        for key in ("lr", "weight_decay", "epochs", "batch_size", "embed_dim",
+                     "num_encoder_layers", "num_cross_attn_layers", "max_grid_size"):
+            saved_val = saved_args.get(key)
+            current_val = getattr(args, key, None)
+            if saved_val is not None and current_val != saved_val:
+                print(f"  WARNING: --{key} changed: checkpoint={saved_val}, current={current_val}")
+
+        state = state.replace(
+            params=ckpt["params"],
+            model_state=ckpt["model_state"],
+            opt_state=ckpt["opt_state"],
+            step=ckpt["step"],
+            rng=ckpt["rng"],
+        )
+
+        start_epoch = ckpt["epoch"] + 1
+        resume_state = {
+            "best_val_acc": ckpt["best_val_acc"],
+            "patience_counter": ckpt["patience_counter"],
+            "history": ckpt["history"],
+            "np_rng_state": ckpt["np_rng_state"],
+        }
+        print(f"  Resuming from epoch {start_epoch}, step {ckpt['step']}, "
+              f"best_val_acc={ckpt['best_val_acc']:.4f}")
+
     # Replicate state across all devices for data parallelism (multi-host safe).
     state = _replicate_state(state, replicated)
 
     print("Training... (first step will be slow due to JIT compilation)")
-    state, history = train_fusion(state, train_ds, val_ds, args, data_sharding=data_sharding)
+    state, history = train_fusion(
+        state, train_ds, val_ds, args,
+        data_sharding=data_sharding,
+        start_epoch=start_epoch,
+        resume_state=resume_state,
+    )
 
     if jax.process_index() == 0:
         history_path = os.path.join(args.out_dir, "fusion_history.json")
