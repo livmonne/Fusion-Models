@@ -187,8 +187,30 @@ class TestGuessComponent:
         """Output logits and pooled representation must have expected shapes."""
         guess = GuessComponent(embed_dim=EMBED, num_colours=NUM_COLOURS)
         x = torch.randn(BATCH, MAX_CELLS, EMBED)
-        logits, pooled = guess(x)
+        h = torch.randn(BATCH, EMBED)
+        logits, pooled = guess(x, h, grid_h=MAX_GRID, grid_w=MAX_GRID)
         assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
+        assert pooled.shape == (BATCH, EMBED)
+
+    def test_local_attention_alternation(self) -> None:
+        """Even layers should use local attention, odd layers global."""
+        guess = GuessComponent(
+            embed_dim=EMBED, num_colours=NUM_COLOURS, num_layers=4, window_size=3,
+        )
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
+        h = torch.randn(BATCH, EMBED)
+        logits, pooled = guess(x, h, grid_h=MAX_GRID, grid_w=MAX_GRID)
+        assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
+        assert pooled.shape == (BATCH, EMBED)
+
+    def test_rectangular_grid(self) -> None:
+        """GuessComponent should handle non-square grids (H != W)."""
+        H, W = 3, MAX_GRID
+        guess = GuessComponent(embed_dim=EMBED, num_colours=NUM_COLOURS)
+        x = torch.randn(BATCH, H * W, EMBED)
+        h = torch.randn(BATCH, EMBED)
+        logits, pooled = guess(x, h, grid_h=H, grid_w=W)
+        assert logits.shape == (BATCH, H * W, NUM_COLOURS)
         assert pooled.shape == (BATCH, EMBED)
 
 

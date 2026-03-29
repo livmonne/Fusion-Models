@@ -26,7 +26,7 @@ predicted output grid by inferring the transformation rule from the demos.
    router:
    - :class:`~fusion_model.memory.RuleMemory`
    - :class:`~fusion_model.rule_engine.RuleGenerator`
-   - :class:`~fusion_model.guess.GuessComponent`
+   - :class:`~fusion_model.guess.GuessComponent` (FiLM-conditioned local/global attention)
 6. **DecisionRouter** — produces softmax mixture weights ``alpha`` over
    the three pathways.
 7. **Output** — the blended per-cell logits ``(batch, seq, num_colours)``.
@@ -303,7 +303,7 @@ class FusionModel(nn.Module):
         # Each expert receives x (B, seq, E) and produces (B, seq, num_colours).
         logits_mem, mem_repr, retrieval_info = self.memory(x, h)
         logits_rule, confidence, rule_repr, proposal = self.rule_gen(x, h)
-        logits_guess, guess_repr = self.guess(x)
+        logits_guess, guess_repr = self.guess(x, h, grid_h=H, grid_w=W)
 
         # ── 6. Route and blend ───────────────────────────────────────────
         alpha, router_attn = self.router(h, mem_repr, rule_repr, guess_repr)

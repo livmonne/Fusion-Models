@@ -116,8 +116,9 @@ class DecisionRouter(nn.Module):
             ``(batch, embed_dim)`` — the ephemeral correction vector from
             :class:`~fusion_model.rule_engine.RuleGenerator`.
         :param guess_repr: Guess pathway intermediate representation
-            ``(batch, embed_dim)`` — the pooled self-attention output from
-            :class:`~fusion_model.guess.GuessComponent`.
+            ``(batch, embed_dim)`` — the mean-pooled output from
+            :class:`~fusion_model.guess.GuessComponent`'s local/global
+            attention stack.
         :return: Tuple of ``(alpha, attn_weights)`` where *alpha* has shape
             ``(batch, 3)`` — ``[alpha_mem, alpha_rule, alpha_guess]`` — and
             *attn_weights* has shape ``(batch, num_heads, 3)`` containing
