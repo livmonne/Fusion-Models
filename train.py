@@ -237,6 +237,9 @@ def train_step(
         "correct": correct,
         "total": total,
         "alphas": alphas.mean(axis=0),
+        "aux_mem": loss_dict["aux_mem"],
+        "aux_rule": loss_dict["aux_rule"],
+        "aux_guess": loss_dict["aux_guess"],
     }
     return state, metrics
 
@@ -333,6 +336,7 @@ def train_fusion(
 
         loader = data_loader(train_ds, batch_size=args.batch_size, shuffle=True, rng=rng)
         last_alphas = None
+        last_aux = None
         for batch_jax in prefetch_to_device(loader, data_sharding=data_sharding):
             state, metrics = train_step(state, batch_jax)
 
@@ -341,6 +345,11 @@ def train_fusion(
             epoch_correct += int(metrics["correct"])
             epoch_total += int(metrics["total"])
             last_alphas = metrics["alphas"]
+            last_aux = {
+                "mem": float(metrics["aux_mem"]),
+                "rule": float(metrics["aux_rule"]),
+                "guess": float(metrics["aux_guess"]),
+            }
 
         train_loss = epoch_loss / max(epoch_total, 1)
         train_acc = epoch_correct / max(epoch_total, 1)
@@ -357,11 +366,20 @@ def train_fusion(
                 f"rule={float(last_alphas[1]):.3f}  "
                 f"guess={float(last_alphas[2]):.3f})"
             )
+        aux_str = ""
+        if last_aux is not None:
+            aux_str = (
+                f"mem={last_aux['mem']:.4f}  "
+                f"rule={last_aux['rule']:.4f}  "
+                f"guess={last_aux['guess']:.4f}"
+            )
         print(
             f"Epoch {epoch:3d}/{args.epochs}  "
             f"loss={train_loss:.4f}  train_acc={train_acc:.3f}  "
             f"val_acc={val_acc:.3f}{alpha_str}"
         )
+        if aux_str:
+            print(f"  pathway losses: {aux_str}")
 
         # ── Periodic checkpoint ───────────────────────────────────────
         if jax.process_index() == 0 and epoch % args.ckpt_every == 0:

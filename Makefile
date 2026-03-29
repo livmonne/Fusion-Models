@@ -22,7 +22,7 @@ all: install lint test
 # install — create a virtual environment and install all dependencies.
 # --------------------------------------------------------------------------
 install:
-	uv sync --extra dev
+	uv sync --extra dev --extra tpu
 
 # --------------------------------------------------------------------------
 # lint — run the ruff linter (without auto-fixing).

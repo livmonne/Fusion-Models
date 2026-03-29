@@ -29,7 +29,6 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import optax
 
 
 def cross_entropy_with_ignore(
@@ -92,15 +91,28 @@ def fusion_loss(
 
     # -- 5. Auxiliary losses: per-cell CE for each pathway. --
     aux_loss = jnp.array(0.0)
+    aux_mem = jnp.array(0.0)
+    aux_rule = jnp.array(0.0)
+    aux_guess = jnp.array(0.0)
     if metadata is not None:
         targets_flat = targets.reshape(-1)
+        count = 0
         for key in ("logits_mem", "logits_rule", "logits_guess"):
             if key in metadata:
                 pathway_logits = metadata[key]  # (B, seq, num_colours)
-                aux_loss = aux_loss + cross_entropy_with_ignore(
+                ce = cross_entropy_with_ignore(
                     pathway_logits.reshape(-1, C), targets_flat, ignore_index=pad_value,
                 )
-        aux_loss = aux_loss / 3.0
+                aux_loss = aux_loss + ce
+                count += 1
+                if key == "logits_mem":
+                    aux_mem = ce
+                elif key == "logits_rule":
+                    aux_rule = ce
+                else:
+                    aux_guess = ce
+        if count > 0:
+            aux_loss = aux_loss / count
 
     # -- 6. Commitment rate regularisation. --
     commit_reg = jnp.array(0.0)
@@ -137,6 +149,9 @@ def fusion_loss(
         "storage_cost": storage_cost,
         "entropy": entropy,
         "aux": aux_loss,
+        "aux_mem": aux_mem,
+        "aux_rule": aux_rule,
+        "aux_guess": aux_guess,
         "commit_reg": commit_reg,
         "strength_reg": strength_reg,
     }
