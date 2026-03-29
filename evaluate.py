@@ -54,12 +54,15 @@ def gather_predictions(
     model_state: dict | None,
     dataset: ARCDataset,
     batch_size: int,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray]:
-    """Run inference and collect per-sample predictions."""
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray, dict[str, np.ndarray]]:
+    """Run inference and collect per-sample predictions and metadata."""
     all_preds: list[np.ndarray] = []
     all_targets: list[np.ndarray] = []
     all_inputs: list[np.ndarray] = []
     all_alphas: list[np.ndarray] = []
+    all_retrieval_scores: list[np.ndarray] = []
+    all_strength: list[np.ndarray] = []
+    all_rule_confidence: list[np.ndarray] = []
 
     for batch in data_loader(dataset, batch_size=batch_size, shuffle=False):
         batch_jax = {k: jnp.array(v) for k, v in batch.items()}
@@ -68,7 +71,7 @@ def gather_predictions(
         if model_state is not None:
             variables["state"] = model_state
 
-        logits, alphas, _ = model.apply(
+        logits, alphas, meta = model.apply(
             variables,
             batch_jax["demo_inputs"],
             batch_jax["demo_outputs"],
@@ -79,6 +82,9 @@ def gather_predictions(
 
         preds = np.array(logits.argmax(axis=-1))  # (B, max_cells)
         all_alphas.append(np.array(alphas))
+        all_retrieval_scores.append(np.array(meta["retrieval_scores"]))
+        all_strength.append(np.array(meta["memory_strength"]))
+        all_rule_confidence.append(np.array(meta["rule_confidence"]))
 
         B = batch["test_input"].shape[0]
         G = batch["test_input"].shape[1]
@@ -95,7 +101,12 @@ def gather_predictions(
             all_inputs.append(inp_grid)
 
     alphas_arr = np.concatenate(all_alphas)
-    return all_preds, all_targets, all_inputs, alphas_arr
+    meta_arrays = {
+        "retrieval_scores": np.concatenate(all_retrieval_scores),
+        "strength": all_strength[0] if all_strength else np.array([]),
+        "rule_confidence": np.concatenate(all_rule_confidence),
+    }
+    return all_preds, all_targets, all_inputs, alphas_arr, meta_arrays
 
 
 # ── Visualisations ──────────────────────────────────────────────────────────
@@ -200,9 +211,66 @@ def plot_training_curves(out_dir: str) -> None:
     print("Saved training_curves.png")
 
 
+def print_memory_summary(
+    model_state: dict | None,
+    meta_arrays: dict[str, np.ndarray],
+) -> None:
+    """Print a detailed summary of the rule memory state and retrieval behaviour."""
+    print("\n── Rule Memory Summary ─────────────────────────────────────────")
+
+    retrieval = meta_arrays["retrieval_scores"]  # (N, S)
+    strength = meta_arrays["strength"]            # (S,)
+    confidence = meta_arrays["rule_confidence"]   # (N,) or (N, 1)
+
+    mean_retrieval = retrieval.mean(axis=0)       # (S,)
+    num_slots = len(mean_retrieval)
+    top_k = min(10, num_slots)
+
+    print(f"  Slots:            {num_slots}")
+    print(f"  Rule confidence:  mean={confidence.mean():.4f}  "
+          f"min={confidence.min():.4f}  max={confidence.max():.4f}")
+
+    if len(strength) > 0:
+        print(f"  Slot strength:    mean={strength.mean():.4f}  "
+              f"min={strength.min():.4f}  max={strength.max():.4f}  "
+              f"active(>0.1)={int((strength > 0.1).sum())}/{num_slots}")
+
+    if model_state is not None and "memory" in model_state:
+        mem = model_state["memory"]
+        freq = np.array(mem.get("frequency", []))
+        utility = np.array(mem.get("utility", []))
+        steps = np.array(mem.get("steps_since_activation", []))
+
+        if len(freq) > 0:
+            print(f"  Slot frequency:   mean={freq.mean():.4f}  "
+                  f"min={freq.min():.4f}  max={freq.max():.4f}")
+        if len(utility) > 0:
+            print(f"  Slot utility:     mean={utility.mean():.4f}  "
+                  f"min={utility.min():.4f}  max={utility.max():.4f}  "
+                  f"active(>0.01)={int((utility > 0.01).sum())}/{num_slots}")
+        if len(steps) > 0:
+            print(f"  Steps since act:  mean={steps.mean():.0f}  "
+                  f"min={steps.min():.0f}  max={steps.max():.0f}")
+
+    # Top-k most retrieved slots.
+    top_idx = np.argsort(mean_retrieval)[::-1][:top_k]
+    print(f"\n  Top {top_k} retrieved slots (by mean score across eval set):")
+    for rank, idx in enumerate(top_idx):
+        s = f"    #{rank+1:2d}  slot {idx:3d}  retrieval={mean_retrieval[idx]:.4f}"
+        if len(strength) > 0:
+            s += f"  strength={strength[idx]:.4f}"
+        if model_state is not None and "memory" in model_state:
+            utility = np.array(model_state["memory"].get("utility", []))
+            if len(utility) > idx:
+                s += f"  utility={utility[idx]:.4f}"
+        print(s)
+
+    print()
+
+
 def plot_rule_utility(model_state: dict, out_dir: str) -> None:
     """Bar chart showing how much each memory slot is used."""
-    utility = np.array(model_state["memory"]["state"]["utility"])
+    utility = np.array(model_state["memory"]["utility"])
 
     fig, ax = plt.subplots(figsize=(7, 3))
     ax.bar(range(len(utility)), utility)
@@ -256,23 +324,26 @@ def main() -> None:
     print(f"Loaded weights from {ckpt_path}")
 
     # ── Predictions ──────────────────────────────────────────────────────
-    preds, targets, inputs, alphas = gather_predictions(
+    preds, targets, inputs, alphas, meta_arrays = gather_predictions(
         model, params, model_state, val_ds, args.batch_size,
     )
 
     # ── 1. Accuracy summary ──────────────────────────────────────────────
     print_accuracy_summary(preds, targets)
 
-    # ── 2. Router summary ────────────────────────────────────────────────
+    # ── 2. Memory summary ────────────────────────────────────────────────
+    print_memory_summary(model_state, meta_arrays)
+
+    # ── 3. Router summary ────────────────────────────────────────────────
     plot_router_summary(alphas, args.out_dir)
 
-    # ── 3. Sample grid visualisations ────────────────────────────────────
+    # ── 4. Sample grid visualisations ────────────────────────────────────
     plot_sample_grids(inputs, preds, targets, args.out_dir)
 
-    # ── 4. Training curves ───────────────────────────────────────────────
+    # ── 5. Training curves ───────────────────────────────────────────────
     plot_training_curves(args.out_dir)
 
-    # ── 5. Rule utility ──────────────────────────────────────────────────
+    # ── 6. Rule utility ──────────────────────────────────────────────────
     if model_state is not None:
         plot_rule_utility(model_state, args.out_dir)
 
