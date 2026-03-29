@@ -109,15 +109,23 @@ class FusionLoss(nn.Module):
 
         # -- 5. Auxiliary losses: per-cell CE for each pathway. --
         aux_loss = torch.tensor(0.0, device=logits.device)
+        aux_mem = torch.tensor(0.0, device=logits.device)
+        aux_rule = torch.tensor(0.0, device=logits.device)
+        aux_guess = torch.tensor(0.0, device=logits.device)
         if metadata is not None:
             targets_flat = targets.reshape(-1)
+            aux_parts: dict[str, torch.Tensor] = {}
             for key in ("logits_mem", "logits_rule", "logits_guess"):
                 if key in metadata:
                     pathway_logits = metadata[key]  # (B, seq, num_colours)
-                    aux_loss = aux_loss + self.ce(
+                    aux_parts[key] = self.ce(
                         pathway_logits.reshape(-1, C), targets_flat,
                     )
-            aux_loss = aux_loss / 3.0
+            if aux_parts:
+                aux_mem = aux_parts.get("logits_mem", aux_mem)
+                aux_rule = aux_parts.get("logits_rule", aux_rule)
+                aux_guess = aux_parts.get("logits_guess", aux_guess)
+                aux_loss = sum(aux_parts.values()) / len(aux_parts)
 
         # -- 6. Commitment rate regularisation. --
         commit_reg = torch.tensor(0.0, device=logits.device)
@@ -154,6 +162,9 @@ class FusionLoss(nn.Module):
             "storage_cost": storage_cost.item(),
             "entropy": entropy.item(),
             "aux": aux_loss.item(),
+            "aux_mem": aux_mem.item(),
+            "aux_rule": aux_rule.item(),
+            "aux_guess": aux_guess.item(),
             "commit_reg": commit_reg.item(),
             "strength_reg": strength_reg.item(),
         }

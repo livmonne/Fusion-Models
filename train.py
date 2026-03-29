@@ -254,12 +254,18 @@ def train_fusion(
             f"rule={alphas[:, 1].mean():.3f}  "
             f"guess={alphas[:, 2].mean():.3f}"
         )
+        aux_losses = (
+            f"mem={loss_dict['aux_mem']:.4f}  "
+            f"rule={loss_dict['aux_rule']:.4f}  "
+            f"guess={loss_dict['aux_guess']:.4f}"
+        )
         print(
             f"Epoch {epoch:3d}/{args.epochs}  "
             f"loss={train_loss:.4f}  train_acc={train_acc:.3f}  "
             f"val_acc={val_acc:.3f}  lr={current_lr:.2e}  "
             f"alpha({alpha_mean})"
         )
+        print(f"  pathway losses: {aux_losses}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
