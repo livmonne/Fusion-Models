@@ -1,7 +1,7 @@
 # Fusion Model — Abstract Reasoning on ARC-AGI-2
 
 A neural architecture that combines **rule memory**, **rule generation**,
-**self-attention guessing**, and a **learned decision router** into a single
+**deep spatial guessing**, and a **learned decision router** into a single
 end-to-end trainable model, applied to the
 [ARC-AGI-2](https://github.com/arcprize/ARC-AGI-2) abstract reasoning
 benchmark.
@@ -41,7 +41,7 @@ Demo Pairs (input/output grids)                Test Input Grid
               │                │
        ┌──────┼────────────────┼──────────────┐
        ▼      ▼                ▼              ▼
-  RuleMemory(x, h)    RuleGenerator(x, h)  GuessComponent(x)
+  RuleMemory(x, h)    RuleGenerator(x, h)  GuessComponent(x, h, G)
        │                    │                  │
   (B, seq, 10)        (B, seq, 10)       (B, seq, 10)
   + mem_repr (B,E)    + rule_repr (B,E)  + guess_repr (B,E)
@@ -81,7 +81,7 @@ Demo Pairs (input/output grids)                Test Input Grid
 | **Multi-Head Cross-Attention** | Test input tokens cross-attend to the demo context. Each head can focus on different aspects of the demonstrated transformation (colour mapping, spatial pattern, etc.). This is the core mechanism for transferring the inferred rule to the test input. |
 | **RuleMemory** | Bank of 128 learned low-rank rules with trigger embeddings. Receives the full spatial sequence `x` and pooled `h`: retrieval scores are computed from `h` via **strength-gated** soft attention (frequency × recency), while low-rank corrections `A @ (B @ x_token)` and per-slot classification heads are applied independently to every spatial token, producing per-cell colour logits `(batch, seq, 10)`. Learnable decay/reinforcement rates and recency half-life. Automatic pruning of forgotten slots. Supports soft-blend commitment of proposed rules. Returns a mean-pooled correction vector as its router representation. |
 | **RuleGenerator** | Produces ephemeral one-shot rules as low-rank corrections: an MLP generates A, B matrices from pooled `h`, then the correction `A @ (B @ x_token)` is applied per spatial token, yielding per-cell logits `(batch, seq, 10)`. Maintains a circular history buffer of `(embedding, decision, outcome)` triples and uses a three-stage cross-attention pipeline — operating entirely on history, not the current input — to propose persistent rules: (1) historical inputs attend over historical decisions, (2) that result attends over outcome signals (per-sample loss), (3) a learned synthesis query fuses the two. Produces a soft commit weight for blending into the weakest memory slot. Returns a mean-pooled correction vector as its router representation. |
-| **GuessComponent** | Multi-head self-attention over the full spatial token sequence `x`, followed by a per-token MLP classification head for fuzzy pattern matching. Returns per-cell logits `(batch, seq, 10)` and a mean-pooled representation for routing. |
+| **GuessComponent** | Deep spatial predictor with a stack of Transformer layers alternating between **local** (windowed) and **global** self-attention, each followed by a proper FFN and **FiLM conditioning** from the pooled embedding `h`. Local layers restrict each token's receptive field to a Chebyshev-distance neighbourhood on the 2-D grid (default 7×7 window), encouraging fine-grained spatial pattern detection. Global layers allow unrestricted attention for long-range integration. Returns per-cell logits `(batch, seq, 10)` and a mean-pooled representation for routing. |
 | **DecisionRouter** | Multi-head cross-attention router (4 heads): uses ``h`` as query and each pathway's pooled representation as keys *and* values.  A residual connection adds ``h`` back to the attention context, followed by LayerNorm, so the routing MLP always sees both the raw input and the pathway-informed context.  A two-layer MLP (Linear → GELU → Linear) maps the normalised vector to three routing logits, enabling nonlinear feature interactions.  Per-head attention weights are returned for interpretability. |
 
 ### Spatial Expert Pathways
@@ -93,9 +93,10 @@ through to the output, allowing each expert to make position-dependent
 predictions.
 
 The pooled vector `h` is still computed (via masked mean-pooling + a
-projection) and used for:
+projection) and used by all three pathways plus the router:
 - **Retrieval key matching** in RuleMemory (which rules to activate)
 - **Ephemeral MLP input** in RuleGenerator (what correction to produce)
+- **FiLM conditioning** in GuessComponent (task-level modulation of per-token features)
 - **Router query** in DecisionRouter (how to blend the experts)
 - **History buffer entries** in RuleGenerator (for rule proposal)
 
@@ -181,8 +182,8 @@ The architecture follows a **perceive → specialise → arbitrate** pipeline:
    independently, each producing per-cell colour logits `(batch, seq, 10)`:
    - **RuleMemory** retrieves and applies stored rules per token.
    - **RuleGenerator** synthesises one-shot rules and applies them per token.
-   - **GuessComponent** uses self-attention over spatial tokens for fuzzy
-     pattern matching.
+   - **GuessComponent** uses alternating local/global self-attention with
+     FiLM conditioning from `h` for fuzzy spatial pattern matching.
 
 4. **Arbitrate** — the DecisionRouter uses multi-head cross-attention
    (querying each expert's pooled representation with `h`) to produce
@@ -304,7 +305,7 @@ fusion_model/
     model.py            # FusionModel orchestrator (grid encoder + cross-attention + fusion)
     memory.py           # RuleMemory (low-rank rule bank + differentiable retrieval)
     rule_engine.py      # RuleGenerator (ephemeral hypothesis proposer)
-    guess.py            # GuessComponent (self-attention predictor)
+    guess.py            # GuessComponent (deep spatial predictor with local/global attention + FiLM)
     decision.py         # DecisionRouter (softmax mixture weights)
     loss.py             # FusionLoss (task + regularisation terms)
 tasks/

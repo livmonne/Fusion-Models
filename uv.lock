@@ -385,14 +385,16 @@ dev = [
 ]
 tpu = [
     { name = "jax", extra = ["tpu"] },
+    { name = "libtpu" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "flax", specifier = ">=0.8.0" },
     { name = "jax", specifier = ">=0.4.20" },
-    { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = ">=0.4.20" },
+    { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'" },
     { name = "jaxlib", specifier = ">=0.4.20" },
+    { name = "libtpu", marker = "extra == 'tpu'" },
     { name = "matplotlib" },
     { name = "mypy", marker = "extra == 'dev'" },
     { name = "numpy" },

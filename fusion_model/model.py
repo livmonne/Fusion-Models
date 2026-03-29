@@ -298,7 +298,7 @@ class FusionModel(nn.Module):
         # ── 5. Expert pathways (spatial) ─────────────────────────────────
         logits_mem, mem_repr, retrieval_info = self.memory(x, h, training=training)
         logits_rule, confidence, rule_repr, proposal = self.rule_gen(x, h, training=training)
-        logits_guess, guess_repr = self.guess(x, training=training)
+        logits_guess, guess_repr = self.guess(x, h, G, training=training)
 
         # ── 6. Route and blend ───────────────────────────────────────────
         alpha, router_attn = self.router(h, mem_repr, rule_repr, guess_repr)
