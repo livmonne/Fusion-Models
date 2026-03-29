@@ -56,6 +56,13 @@ def count_params(params: Any) -> int:
 # ── Data prefetching ─────────────────────────────────────────────────────────
 
 
+_SHARD_PAD_VALUES: dict[str, int] = {
+    "test_output": PAD_VALUE,
+    "demo_inputs": PAD_VALUE,
+    "demo_outputs": PAD_VALUE,
+}
+
+
 def _shard_batch(
     batch: dict[str, np.ndarray],
     data_sharding: NamedSharding,
@@ -80,7 +87,8 @@ def _shard_batch(
         if global_bs % num_devices != 0:
             padded_bs = ((global_bs + num_devices - 1) // num_devices) * num_devices
             pad_widths = [(0, padded_bs - global_bs)] + [(0, 0)] * (v.ndim - 1)
-            v = np.pad(v, pad_widths, mode="constant", constant_values=0)
+            fill = _SHARD_PAD_VALUES.get(k, 0)
+            v = np.pad(v, pad_widths, mode="constant", constant_values=fill)
         else:
             padded_bs = global_bs
 
@@ -409,14 +417,12 @@ def train_fusion(
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             patience_counter = 0
-            # Only process 0 saves checkpoints in multi-host setups.
-            if jax.process_index() == 0:
-                ckpt = {
-                    "params": jax.device_get(state.params),
-                    "model_state": jax.device_get(state.model_state),
-                }
-                with open(os.path.join(args.out_dir, "fusion_best.pkl"), "wb") as f:
-                    pickle.dump(ckpt, f)
+            ckpt = {
+                "params": jax.device_get(state.params),
+                "model_state": jax.device_get(state.model_state),
+            }
+            with open(os.path.join(args.out_dir, "fusion_best.pkl"), "wb") as f:
+                pickle.dump(ckpt, f)
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
