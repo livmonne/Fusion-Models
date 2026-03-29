@@ -316,6 +316,7 @@ class FusionModel(nn.Module):
             "logits_guess": logits_guess,
             "retrieval_scores": retrieval_info["scores"],
             "memory_strength": retrieval_info["strength"],
+            "retrieval_head_attn": retrieval_info["head_attn"],
             "rule_confidence": confidence,
             "router_attn": router_attn,
             "proposal": proposal,

@@ -8,8 +8,9 @@ to the current input and blends their corrections together.
 Each *rule slot* stores three things:
 
 1. **key** — a trigger embedding that determines *when* the rule fires.
-   The model computes cosine-like attention between the input embedding and
-   every key to decide relevance.
+   Multi-head cross-attention between the pooled input embedding and every
+   key allows different heads to specialise on different aspects of
+   relevance (e.g. spatial layout vs colour transformation).
 2. **A, B** — a pair of small matrices whose product ``A @ (B @ x)`` forms a
    low-rank correction to the per-token embeddings.  This is the same idea
    as LoRA (Hu et al., 2021): rather than storing a full weight matrix we
@@ -17,8 +18,10 @@ Each *rule slot* stores three things:
 3. **head** — a tiny linear projection that converts the correction into
    per-cell colour logits.
 
-Retrieval uses scaled-dot-product soft attention so that gradients flow
-through the memory bank and the whole system is end-to-end trainable.
+Retrieval uses multi-head scaled-dot-product cross-attention so that
+gradients flow through the memory bank and the whole system is end-to-end
+trainable.  A learned head-combination vector merges per-head attention
+distributions into final per-slot retrieval scores.
 
 **Memory strength (biologically-inspired decay & reinforcement):**
 
@@ -63,9 +66,80 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
+
+
+class MultiHeadMemoryCrossAttention(nn.Module):
+    """Multi-head cross-attention for memory slot retrieval.
+
+    Queries are derived from the pooled task embedding; keys and values are
+    projected from the memory slot key bank.  Each attention head
+    independently assesses slot relevance, then a *learned* head-combination
+    vector merges the per-head distributions into a single per-slot score.
+
+    The module also returns a retrieved *context* vector (the standard
+    multi-head attention output), which enriches the downstream memory
+    representation fed to the decision router.
+
+    :param embed_dim: Embedding dimensionality (must be divisible by
+        ``num_heads``).
+    :param num_heads: Number of parallel attention heads.
+    """
+
+    embed_dim: int = 256
+    num_heads: int = 8
+
+    @nn.compact
+    def __call__(
+        self,
+        h: jnp.ndarray,
+        keys: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Compute multi-head cross-attention retrieval scores.
+
+        :param h: Pooled task embedding ``(batch, embed_dim)``.
+        :param keys: Memory slot keys ``(num_slots, embed_dim)``.
+        :return: ``(scores, context, head_attn)`` where
+
+            - **scores** ``(batch, num_slots)`` — combined retrieval weights
+              (summing to 1 over slots).
+            - **context** ``(batch, embed_dim)`` — retrieved memory context.
+            - **head_attn** ``(batch, num_heads, num_slots)`` — per-head
+              attention maps for analysis.
+        """
+        assert self.embed_dim % self.num_heads == 0, (
+            f"embed_dim ({self.embed_dim}) must be divisible by num_heads ({self.num_heads})"
+        )
+        head_dim = self.embed_dim // self.num_heads
+        B = h.shape[0]
+        S = keys.shape[0]
+
+        Q = nn.Dense(self.embed_dim, use_bias=False, name="q_proj")(h)  # (B, E)
+        K = nn.Dense(self.embed_dim, use_bias=False, name="k_proj")(keys)  # (S, E)
+        V = nn.Dense(self.embed_dim, use_bias=False, name="v_proj")(keys)  # (S, E)
+
+        Q = Q.reshape(B, self.num_heads, head_dim)  # (B, H, D)
+        K = K.reshape(S, self.num_heads, head_dim)  # (S, H, D)
+        V = V.reshape(S, self.num_heads, head_dim)  # (S, H, D)
+
+        attn_logits = jnp.einsum("bhd,shd->bhs", Q, K) / (head_dim**0.5)
+        head_attn = jax.nn.softmax(attn_logits, axis=-1)  # (B, H, S)
+
+        retrieved = jnp.einsum("bhs,shd->bhd", head_attn, V)  # (B, H, D)
+        retrieved = retrieved.reshape(B, self.embed_dim)  # (B, E)
+        context = nn.Dense(self.embed_dim, name="out_proj")(retrieved)
+
+        head_combine = self.param(
+            "head_combine",
+            nn.initializers.ones_init(),
+            (self.num_heads,),
+        )
+        head_w = jax.nn.softmax(head_combine)
+        scores = jnp.einsum("bhs,h->bs", head_attn, head_w)  # (B, S)
+
+        return scores, context, head_attn
 
 
 class RuleMemory(nn.Module):
@@ -74,13 +148,17 @@ class RuleMemory(nn.Module):
 
     Now operates on **per-token spatial embeddings** rather than a single
     pooled vector.  Retrieval scores are computed from the pooled embedding
-    ``h`` (one score vector per sample), while the low-rank corrections and
+    ``h`` via **multi-head cross-attention** over the slot key bank (one
+    combined score vector per sample), while the low-rank corrections and
     classification heads are applied independently to every spatial token.
 
     :param embed_dim: Dimensionality of the shared input embedding.
     :param num_colours: Number of per-cell colour classes (10 for ARC).
     :param num_slots: How many rule slots to allocate.
     :param rank: Inner rank of each rule's low-rank decomposition ``A @ (B @ x)``.
+    :param num_retrieval_heads: Number of attention heads used for memory
+        retrieval.  Each head independently assesses slot relevance; a
+        learned combination merges them into final per-slot scores.
     :param prune_threshold: Strength below which a slot is considered
         "forgotten" and eligible for recycling.
     :param prune_every_n_steps: How often (in forward passes) to run the
@@ -94,6 +172,7 @@ class RuleMemory(nn.Module):
     num_colours: int = 10
     num_slots: int = 16
     rank: int = 16
+    num_retrieval_heads: int = 8
     prune_threshold: float = 0.05
     prune_every_n_steps: int = 100
     recency_activation_threshold: float = 0.1
@@ -106,7 +185,9 @@ class RuleMemory(nn.Module):
             (self.num_slots, self.embed_dim),
         )
         self.B = self.param(
-            "B", nn.initializers.zeros_init(), (self.num_slots, self.rank, self.embed_dim),
+            "B",
+            nn.initializers.zeros_init(),
+            (self.num_slots, self.rank, self.embed_dim),
         )
         self.A = self.param(
             "A",
@@ -121,36 +202,55 @@ class RuleMemory(nn.Module):
             (self.num_slots, self.num_colours, self.embed_dim),
         )
 
+        # ── Multi-head cross-attention retrieval ──────────────────────────
+        self.retrieval_attn = MultiHeadMemoryCrossAttention(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_retrieval_heads,
+        )
+        self.repr_norm = nn.LayerNorm()
+
         # ── Memory strength: frequency + recency ─────────────────────────
         self.decay_rate_logit = self.param(
-            "decay_rate_logit", lambda _rng, _shape: jnp.array(math.log(0.999 / 0.001)), (),
+            "decay_rate_logit",
+            lambda _rng, _shape: jnp.array(math.log(0.999 / 0.001)),
+            (),
         )
         self.reinforce_rate_logit = self.param(
-            "reinforce_rate_logit", lambda _rng, _shape: jnp.array(math.log(0.01 / 0.99)), (),
+            "reinforce_rate_logit",
+            lambda _rng, _shape: jnp.array(math.log(0.01 / 0.99)),
+            (),
         )
         self.recency_halflife_log = self.param(
-            "recency_halflife_log", lambda _rng, _shape: jnp.array(math.log(500.0)), (),
+            "recency_halflife_log",
+            lambda _rng, _shape: jnp.array(math.log(500.0)),
+            (),
         )
 
         # ── Mutable state (buffers) ──────────────────────────────────────
         self._frequency = self.variable(
-            "state", "frequency", lambda: jnp.full((self.num_slots,), 0.5),
+            "state",
+            "frequency",
+            lambda: jnp.full((self.num_slots,), 0.5),
         )
         self._steps_since_activation = self.variable(
-            "state", "steps_since_activation", lambda: jnp.zeros((self.num_slots,)),
+            "state",
+            "steps_since_activation",
+            lambda: jnp.zeros((self.num_slots,)),
         )
         self._step_counter = self.variable(
-            "state", "step_counter", lambda: jnp.array(0, dtype=jnp.int32),
+            "state",
+            "step_counter",
+            lambda: jnp.array(0, dtype=jnp.int32),
         )
         self._utility = self.variable(
-            "state", "utility", lambda: jnp.zeros((self.num_slots,)),
+            "state",
+            "utility",
+            lambda: jnp.zeros((self.num_slots,)),
         )
 
     # ── Strength computation ────────────────────────────────────────────
 
-    def get_strength(
-        self, freq_override: jnp.ndarray | None = None
-    ) -> jnp.ndarray:
+    def get_strength(self, freq_override: jnp.ndarray | None = None) -> jnp.ndarray:
         """Compute per-slot memory strength as ``frequency_score * recency_score``.
 
         :param freq_override: If provided, use this tensor instead of
@@ -161,20 +261,23 @@ class RuleMemory(nn.Module):
         """
         freq_score = jnp.clip(
             freq_override if freq_override is not None else self._frequency.value,
-            0.0, 1.0,
+            0.0,
+            1.0,
         )
 
         half_life = jnp.clip(jnp.exp(self.recency_halflife_log), min=1.0)
-        recency_score = jnp.exp(
-            -math.log(2.0) * self._steps_since_activation.value / half_life
-        )
+        recency_score = jnp.exp(-math.log(2.0) * self._steps_since_activation.value / half_life)
 
         return freq_score * recency_score
 
     # ── Forward pass ──────────────────────────────────────────────────────
 
     def __call__(
-        self, x: jnp.ndarray, h: jnp.ndarray, *, training: bool = False,
+        self,
+        x: jnp.ndarray,
+        h: jnp.ndarray,
+        *,
+        training: bool = False,
     ) -> tuple[jnp.ndarray, jnp.ndarray, dict[str, Any]]:
         """Retrieve relevant rules and produce per-cell memory-pathway logits.
 
@@ -184,9 +287,9 @@ class RuleMemory(nn.Module):
         :param training: Whether we are in training mode.
         :return: Tuple of ``(logits_mem, mem_repr, retrieval_info)``.
         """
-        # -- 1. Retrieval scores from pooled h --
-        raw_scores = jnp.matmul(h, self.keys.T) / (self.embed_dim ** 0.5)
-        raw_scores = jax.nn.softmax(raw_scores, axis=-1)  # (B, S)
+        # -- 1. Multi-head cross-attention retrieval from pooled h --
+        raw_scores, mem_context, head_attn = self.retrieval_attn(h, self.keys)
+        # raw_scores: (B, S), mem_context: (B, E), head_attn: (B, H, S)
 
         # -- 2. Compute differentiable frequency & gate by memory strength --
         if training:
@@ -219,8 +322,8 @@ class RuleMemory(nn.Module):
         slot_logits = jnp.einsum("btse, sce -> btsc", correction, self.heads_weight)
         logits_mem = jnp.einsum("bs, btsc -> btc", scores, slot_logits)
 
-        # -- 6. Router representation: mean-pool blended correction --
-        mem_repr = blended.mean(axis=1)  # (B, E)
+        # -- 6. Router representation: mean-pool correction + cross-attn context --
+        mem_repr = self.repr_norm(blended.mean(axis=1) + mem_context)  # (B, E)
 
         # -- 7. Persist frequency state & update recency (training only) --
         if training and new_freq is not None:
@@ -244,6 +347,7 @@ class RuleMemory(nn.Module):
         retrieval_info: dict[str, Any] = {
             "scores": scores,
             "strength": strength,
+            "head_attn": head_attn,
         }
         return logits_mem, mem_repr, retrieval_info
 
@@ -279,15 +383,9 @@ class RuleMemory(nn.Module):
         """
         w = commit_weight
 
-        new_keys = self.keys.at[slot_idx].set(
-            self.keys[slot_idx] * (1 - w) + key * w
-        )
-        new_A = self.A.at[slot_idx].set(
-            self.A[slot_idx] * (1 - w) + A * w
-        )
-        new_B = self.B.at[slot_idx].set(
-            self.B[slot_idx] * (1 - w) + B * w
-        )
+        new_keys = self.keys.at[slot_idx].set(self.keys[slot_idx] * (1 - w) + key * w)
+        new_A = self.A.at[slot_idx].set(self.A[slot_idx] * (1 - w) + A * w)
+        new_B = self.B.at[slot_idx].set(self.B[slot_idx] * (1 - w) + B * w)
 
         self._utility.value = self._utility.value.at[slot_idx].set(
             self._utility.value[slot_idx] * (1.0 - w)
@@ -295,7 +393,9 @@ class RuleMemory(nn.Module):
         self._frequency.value = self._frequency.value.at[slot_idx].set(
             jnp.maximum(w, self._frequency.value[slot_idx])
         )
-        self._steps_since_activation.value = self._steps_since_activation.value.at[slot_idx].set(0.0)
+        self._steps_since_activation.value = self._steps_since_activation.value.at[slot_idx].set(
+            0.0
+        )
 
         return {"keys": new_keys, "A": new_A, "B": new_B}
 
@@ -313,7 +413,9 @@ class RuleMemory(nn.Module):
         dead = strength < self.prune_threshold
 
         self._frequency.value = jnp.where(dead, 0.5, self._frequency.value)
-        self._steps_since_activation.value = jnp.where(dead, 0.0, self._steps_since_activation.value)
+        self._steps_since_activation.value = jnp.where(
+            dead, 0.0, self._steps_since_activation.value
+        )
         self._utility.value = jnp.where(dead, 0.0, self._utility.value)
 
     def prune_weak_slots(self, threshold: float | None = None) -> jnp.ndarray:
@@ -327,7 +429,9 @@ class RuleMemory(nn.Module):
         dead = strength < thresh
 
         self._frequency.value = jnp.where(dead, 0.5, self._frequency.value)
-        self._steps_since_activation.value = jnp.where(dead, 0.0, self._steps_since_activation.value)
+        self._steps_since_activation.value = jnp.where(
+            dead, 0.0, self._steps_since_activation.value
+        )
         self._utility.value = jnp.where(dead, 0.0, self._utility.value)
 
         return dead
