@@ -281,9 +281,10 @@ The architecture follows a **perceive → specialise → arbitrate** pipeline:
    Cross-attention transfers the inferred transformation from demos to the
    test input, producing spatial tokens `x (batch, seq, E)`.
 
-2. **Pool** — the cross-attended test tokens are mean-pooled (masking
-   padding) into a global summary vector `h (batch, E)`.  Both `x` and `h`
-   are passed downstream.
+2. **Pool** — the cross-attended test tokens are masked mean-pooled
+   (ignoring padding cells) and then projected through a learned linear
+   layer + GELU activation to produce the global summary vector
+   `h (batch, E)`.  Both `x` and `h` are passed downstream.
 
 3. **Specialise** — three expert pathways process the spatial tokens `x`
    independently (all also receive `h`), each producing per-cell colour
