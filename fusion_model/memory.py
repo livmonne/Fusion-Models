@@ -8,8 +8,9 @@ to the current input and blends their corrections together.
 Each *rule slot* stores three things:
 
 1. **key** — a trigger embedding that determines *when* the rule fires.
-   The model computes cosine-like attention between the input embedding and
-   every key to decide relevance.
+   **Multi-head cross-attention** between the pooled input embedding and
+   every key allows different heads to specialise on different aspects of
+   relevance (e.g. spatial layout vs colour transformation).
 2. **A, B** — a pair of small matrices whose product ``A @ (B @ x)`` forms a
    low-rank correction to the per-token embeddings.  This is the same idea
    as LoRA (Hu et al., 2021): rather than storing a full weight matrix we
@@ -17,8 +18,10 @@ Each *rule slot* stores three things:
 3. **head** — a tiny linear projection that converts the correction into
    per-cell colour logits.
 
-Retrieval uses scaled-dot-product soft attention so that gradients flow
-through the memory bank and the whole system is end-to-end trainable.
+Retrieval uses **multi-head** scaled-dot-product cross-attention so that
+gradients flow through the memory bank and the whole system is end-to-end
+trainable.  A learned head-combination vector merges per-head attention
+distributions into the final per-slot retrieval scores.
 
 **Memory strength (biologically-inspired decay & reinforcement):**
 
@@ -67,19 +70,177 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class MultiHeadMemoryCrossAttention(nn.Module):
+    """Multi-head cross-attention for memory slot retrieval.
+
+    This module replaces a simple single-head dot-product between the pooled
+    task embedding ``h`` and the memory slot keys.  Instead, it projects both
+    the query (``h``) and the keys/values (slot key bank) into multiple
+    independent subspaces ("heads"), computes scaled-dot-product attention in
+    each subspace, and combines the results.
+
+    **Why multiple heads?**
+
+    A single dot-product compresses the notion of "relevance" into one
+    number per slot.  With *H* heads, the model gets *H* independent
+    channels to assess relevance — one head might focus on colour
+    transformations, another on spatial layout, a third on symmetry, etc.
+    The per-head attention maps are then combined through a *learned*
+    head-combination vector into a single set of retrieval scores.
+
+    **Outputs:**
+
+    1. ``scores (batch, num_slots)`` — final retrieval weights (sum to 1
+       over slots), ready to be gated by memory strength.
+    2. ``context (batch, embed_dim)`` — a rich vector summarising what was
+       retrieved, used to enrich the memory pathway's representation for
+       the decision router.
+    3. ``head_attn (batch, num_heads, num_slots)`` — raw per-head attention
+       maps, useful for visualisation and debugging.
+
+    **Architecture (per forward call):**
+
+    ::
+
+        h (B, E)       ──► q_proj ──► Q (B, H, D)  ─┐
+                                                      ├─► attn_logits (B, H, S)
+        keys (S, E)    ──► k_proj ──► K (S, H, D)  ─┘     │
+                       ──► v_proj ──► V (S, H, D)         │
+                                                      softmax
+                                                           │
+                                                    head_attn (B, H, S)
+                                                      │         │
+                                              einsum w/ V    einsum w/ head_combine
+                                                      │         │
+                                              retrieved (B,H,D)  scores (B, S)
+                                                      │
+                                              reshape → out_proj
+                                                      │
+                                              context (B, E)
+
+    :param embed_dim: Embedding dimensionality.  Must be divisible by
+        ``num_heads`` so that each head operates on a ``head_dim``-sized
+        subspace.
+    :param num_heads: Number of parallel attention heads.  More heads
+        give richer retrieval at the cost of a smaller per-head subspace.
+        Typical values: 4 (head_dim=64 at embed_dim=256) or 8
+        (head_dim=32).
+    """
+
+    def __init__(self, embed_dim: int = 256, num_heads: int = 4) -> None:
+        super().__init__()
+        assert embed_dim % num_heads == 0, (
+            f"embed_dim ({embed_dim}) must be divisible by "
+            f"num_heads ({num_heads})"
+        )
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        # Linear projections that map the query and keys/values into
+        # multi-head subspaces.  No bias — following standard practice
+        # for attention Q/K/V projections (bias can shift attention in
+        # undesirable ways and adds no expressivity here).
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        # Output projection: recombines the concatenated per-head
+        # retrieved vectors back into a single embed_dim vector.
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+        # Learned head-combination weights.  Initialised to uniform
+        # (all ones → softmax gives 1/H each) so that early training
+        # uses all heads equally.  The model can later learn to
+        # up-weight the most informative heads.
+        self.head_combine = nn.Parameter(torch.ones(num_heads))
+
+    def forward(
+        self, h: torch.Tensor, keys: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute multi-head cross-attention over the memory slot bank.
+
+        :param h: Pooled task embedding of shape ``(batch, embed_dim)``.
+            This serves as the *query* — "what kind of rules does the
+            current input need?"
+        :param keys: Memory slot key bank of shape ``(num_slots, embed_dim)``.
+            Each row is a learnable trigger embedding.  These serve as
+            both *keys* (for matching) and *values* (for retrieval
+            content), each through their own projection.
+        :return: A 3-tuple ``(scores, context, head_attn)``:
+
+            - **scores** ``(batch, num_slots)`` — combined retrieval
+              weights that sum to 1 over the slot dimension.  These
+              replace the old single-head softmax scores.
+            - **context** ``(batch, embed_dim)`` — a rich retrieved
+              representation formed by the standard multi-head attention
+              output (weighted sum of value projections, concatenated
+              across heads, then linearly projected).  This is added to
+              the memory pathway's router representation so the decision
+              router gets a richer signal.
+            - **head_attn** ``(batch, num_heads, num_slots)`` — the raw
+              per-head softmax attention distributions.  Logged in the
+              training metadata for visualisation and analysis (e.g.
+              checking whether heads have specialised).
+        """
+        B = h.shape[0]
+        S = keys.shape[0]
+        H = self.num_heads
+        D = self.head_dim
+
+        # ── Project into multi-head subspaces ──────────────────────────
+        # Each projection: (*, embed_dim) → (*, embed_dim), then reshaped
+        # into (*, num_heads, head_dim).
+        Q = self.q_proj(h).view(B, H, D)      # (B, H, D)
+        K = self.k_proj(keys).view(S, H, D)    # (S, H, D)
+        V = self.v_proj(keys).view(S, H, D)    # (S, H, D)
+
+        # ── Scaled dot-product attention per head ──────────────────────
+        # attn_logits[b, h, s] = (Q[b,h,:] · K[s,h,:]) / √D
+        # Scaling by √head_dim prevents the dot products from growing
+        # too large in magnitude, which would push softmax into
+        # saturated regions with vanishing gradients.
+        attn_logits = torch.einsum("bhd,shd->bhs", Q, K) / (D ** 0.5)
+        head_attn = F.softmax(attn_logits, dim=-1)  # (B, H, S)
+
+        # ── Retrieve values via attention-weighted sum ─────────────────
+        # For each head, compute a weighted sum of value vectors across
+        # all slots: retrieved[b, h, d] = Σ_s head_attn[b,h,s] · V[s,h,d]
+        retrieved = torch.einsum("bhs,shd->bhd", head_attn, V)  # (B, H, D)
+
+        # Concatenate heads back into full embed_dim and project.
+        retrieved = retrieved.reshape(B, self.embed_dim)    # (B, E)
+        context = self.out_proj(retrieved)                   # (B, E)
+
+        # ── Combine per-head attention into final slot scores ──────────
+        # head_w: (H,) — learned softmax weights over heads.
+        # scores[b, s] = Σ_h head_w[h] · head_attn[b, h, s]
+        # This produces a single attention distribution over slots that
+        # is a convex combination of all heads' distributions.
+        head_w = F.softmax(self.head_combine, dim=0)           # (H,)
+        scores = torch.einsum("bhs,h->bs", head_attn, head_w)  # (B, S)
+
+        return scores, context, head_attn
+
+
 class RuleMemory(nn.Module):
     """Fixed-size bank of learnable low-rank rule slots with biologically-inspired
     memory strength dynamics.
 
     Now operates on **per-token spatial embeddings** rather than a single
     pooled vector.  Retrieval scores are computed from the pooled embedding
-    ``h`` (one score vector per sample), while the low-rank corrections and
+    ``h`` via **multi-head cross-attention** over the slot key bank (one
+    combined score vector per sample), while the low-rank corrections and
     classification heads are applied independently to every spatial token.
 
     :param embed_dim: Dimensionality of the shared input embedding.
     :param num_colours: Number of per-cell colour classes (10 for ARC).
     :param num_slots: How many rule slots to allocate.
     :param rank: Inner rank of each rule's low-rank decomposition ``A @ (B @ x)``.
+    :param num_retrieval_heads: Number of attention heads for multi-head
+        memory retrieval.  Each head independently assesses slot relevance;
+        a learned combination merges them into the final per-slot scores.
+        Must evenly divide ``embed_dim``.
     :param prune_threshold: Strength below which a slot is considered
         "forgotten" and eligible for recycling.
     :param prune_every_n_steps: How often (in forward passes) to run the
@@ -95,6 +256,7 @@ class RuleMemory(nn.Module):
         num_colours: int = 10,
         num_slots: int = 16,
         rank: int = 16,
+        num_retrieval_heads: int = 4,
         prune_threshold: float = 0.05,
         prune_every_n_steps: int = 100,
         recency_activation_threshold: float = 0.1,
@@ -104,11 +266,16 @@ class RuleMemory(nn.Module):
         self.num_colours = num_colours
         self.num_slots = num_slots
         self.rank = rank
+        self.num_retrieval_heads = num_retrieval_heads
         self.prune_threshold = prune_threshold
         self.prune_every_n_steps = prune_every_n_steps
         self.recency_activation_threshold = recency_activation_threshold
 
         # --- Learnable rule bank ---
+        # Each slot's key is a trigger embedding.  The multi-head cross-
+        # attention module projects these through learned K and V
+        # transforms, decoupling "what triggers retrieval" from "what
+        # information is retrieved."
         self.keys = nn.Parameter(torch.randn(num_slots, embed_dim) * 0.02)
 
         # Low-rank factors: correction = A @ (B @ x_token).
@@ -117,6 +284,20 @@ class RuleMemory(nn.Module):
 
         # Per-slot classification head: maps embed_dim → num_colours.
         self.heads = nn.Linear(embed_dim, num_colours * num_slots, bias=False)
+
+        # ── Multi-head cross-attention for retrieval ─────────────────────
+        # Replaces the old single-head dot-product (h @ keys.T / √d).
+        # Each of the `num_retrieval_heads` heads independently assesses
+        # which slots are relevant, then a learned combination merges them.
+        self.retrieval_attn = MultiHeadMemoryCrossAttention(
+            embed_dim=embed_dim,
+            num_heads=num_retrieval_heads,
+        )
+
+        # LayerNorm stabilises the residual sum of the mean-pooled
+        # blended correction and the cross-attention context vector
+        # before it's fed to the decision router.
+        self.repr_norm = nn.LayerNorm(embed_dim)
 
         # Running utility score per slot (not trained — purely diagnostic).
         self.utility: torch.Tensor
@@ -172,9 +353,15 @@ class RuleMemory(nn.Module):
             for the router, and ``retrieval_info`` is a dict with
             ``scores`` and ``strength``.
         """
-        # -- 1. Retrieval scores from pooled h --
-        raw_scores = torch.matmul(h, self.keys.t()) / (self.embed_dim**0.5)
-        raw_scores = F.softmax(raw_scores, dim=-1)  # (B, S)
+        # -- 1. Multi-head cross-attention retrieval from pooled h --
+        # The cross-attention module projects h (query) and self.keys
+        # (key/value) into multiple head subspaces, computes per-head
+        # softmax attention, and merges them via a learned combination.
+        # Returns:
+        #   raw_scores  (B, S) — combined retrieval weights
+        #   mem_context (B, E) — retrieved memory context vector
+        #   head_attn   (B, H, S) — per-head attention maps
+        raw_scores, mem_context, head_attn = self.retrieval_attn(h, self.keys)
 
         # -- 2. Compute differentiable frequency & gate by memory strength --
         # During training, compute new_freq through the learnable decay/reinforce
@@ -211,8 +398,15 @@ class RuleMemory(nn.Module):
         # logits(b, t, c) = Σ_s scores(b, s) · slot_logits(b, t, s, c)
         logits_mem = torch.einsum("bs, btsc -> btc", scores, slot_logits)
 
-        # -- 6. Router representation: mean-pool blended correction --
-        mem_repr = blended.mean(dim=1)  # (B, E)
+        # -- 6. Router representation --
+        # Combine two complementary signals for the decision router:
+        #   (a) Mean-pooled blended correction — the actual per-token
+        #       effect of the selected rules, averaged over positions.
+        #   (b) mem_context — a summary of *which* slots were selected
+        #       and their value projections, from the cross-attention.
+        # The residual sum is stabilised by LayerNorm before being
+        # passed to the router.
+        mem_repr = self.repr_norm(blended.mean(dim=1) + mem_context)  # (B, E)
 
         # -- 7. Persist frequency state & update recency (training only) --
         if self.training:
@@ -235,6 +429,9 @@ class RuleMemory(nn.Module):
         retrieval_info: dict[str, torch.Tensor] = {
             "scores": scores,
             "strength": strength,
+            # Per-head attention maps (B, H, S) for visualisation /
+            # analysis — lets you inspect whether heads have specialised.
+            "head_attn": head_attn,
         }
         return logits_mem, mem_repr, retrieval_info
 

@@ -17,7 +17,7 @@ import torch
 from fusion_model.decision import DecisionRouter
 from fusion_model.guess import GuessComponent
 from fusion_model.loss import FusionLoss
-from fusion_model.memory import RuleMemory
+from fusion_model.memory import MultiHeadMemoryCrossAttention, RuleMemory
 from fusion_model.model import FusionModel
 from fusion_model.rule_engine import RuleGenerator
 from tasks.arc import ARCDataset, ParquetARCDataset, arc_collate_fn, pad_grid
@@ -37,7 +37,11 @@ class TestRuleMemory:
 
     def test_output_shapes(self) -> None:
         """Logits, repr, and retrieval info must have the expected shapes."""
-        mem = RuleMemory(embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK)
+        num_heads = 4
+        mem = RuleMemory(
+            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS,
+            rank=RANK, num_retrieval_heads=num_heads,
+        )
         x = torch.randn(BATCH, MAX_CELLS, EMBED)
         h = torch.randn(BATCH, EMBED)
         logits, mem_repr, info = mem(x, h)
@@ -46,6 +50,7 @@ class TestRuleMemory:
         assert mem_repr.shape == (BATCH, EMBED)
         assert info["scores"].shape == (BATCH, N_SLOTS)
         assert info["strength"].shape == (N_SLOTS,)
+        assert info["head_attn"].shape == (BATCH, num_heads, N_SLOTS)
 
     def test_scores_sum_to_one(self) -> None:
         """Strength-gated retrieval scores must be valid probabilities."""
@@ -126,6 +131,66 @@ class TestRuleMemory:
         assert "decay_rate_logit" in param_names
         assert "reinforce_rate_logit" in param_names
         assert "recency_halflife_log" in param_names
+
+
+class TestMultiHeadMemoryCrossAttention:
+    """Tests for :class:`fusion_model.memory.MultiHeadMemoryCrossAttention`."""
+
+    def test_output_shapes(self) -> None:
+        """Scores, context, and head_attn must have the expected shapes."""
+        num_heads = 4
+        attn = MultiHeadMemoryCrossAttention(embed_dim=EMBED, num_heads=num_heads)
+        h = torch.randn(BATCH, EMBED)
+        keys = torch.randn(N_SLOTS, EMBED)
+        scores, context, head_attn = attn(h, keys)
+
+        assert scores.shape == (BATCH, N_SLOTS)
+        assert context.shape == (BATCH, EMBED)
+        assert head_attn.shape == (BATCH, num_heads, N_SLOTS)
+
+    def test_scores_sum_to_one(self) -> None:
+        """Combined retrieval scores must form valid probability distributions."""
+        attn = MultiHeadMemoryCrossAttention(embed_dim=EMBED, num_heads=4)
+        h = torch.randn(BATCH, EMBED)
+        keys = torch.randn(N_SLOTS, EMBED)
+        scores, _, _ = attn(h, keys)
+        sums = scores.sum(dim=-1)
+        assert torch.allclose(sums, torch.ones(BATCH), atol=1e-5)
+
+    def test_per_head_attn_sums_to_one(self) -> None:
+        """Each head's attention distribution must sum to 1 over slots."""
+        num_heads = 4
+        attn = MultiHeadMemoryCrossAttention(embed_dim=EMBED, num_heads=num_heads)
+        h = torch.randn(BATCH, EMBED)
+        keys = torch.randn(N_SLOTS, EMBED)
+        _, _, head_attn = attn(h, keys)
+        sums = head_attn.sum(dim=-1)  # (B, H)
+        assert torch.allclose(sums, torch.ones(BATCH, num_heads), atol=1e-5)
+
+    def test_num_heads_configurable(self) -> None:
+        """Module must work with various head counts that divide embed_dim."""
+        for n_heads in (1, 2, 4):
+            attn = MultiHeadMemoryCrossAttention(embed_dim=EMBED, num_heads=n_heads)
+            h = torch.randn(BATCH, EMBED)
+            keys = torch.randn(N_SLOTS, EMBED)
+            scores, context, head_attn = attn(h, keys)
+            assert scores.shape == (BATCH, N_SLOTS)
+            assert context.shape == (BATCH, EMBED)
+            assert head_attn.shape == (BATCH, n_heads, N_SLOTS)
+
+    def test_gradients_flow_to_projections(self) -> None:
+        """Gradients must reach Q/K/V projections and the head_combine param."""
+        attn = MultiHeadMemoryCrossAttention(embed_dim=EMBED, num_heads=4)
+        h = torch.randn(BATCH, EMBED)
+        keys = torch.randn(N_SLOTS, EMBED)
+        scores, context, _ = attn(h, keys)
+        loss = scores.sum() + context.sum()
+        loss.backward()
+
+        assert attn.q_proj.weight.grad is not None
+        assert attn.k_proj.weight.grad is not None
+        assert attn.v_proj.weight.grad is not None
+        assert attn.head_combine.grad is not None
 
 
 class TestRuleGenerator:
@@ -321,6 +386,7 @@ class TestFusionModel:
         assert meta["logits_rule"].shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert meta["logits_guess"].shape == (BATCH, MAX_CELLS, NUM_COLOURS)
         assert meta["memory_strength"].shape == (N_SLOTS,)
+        assert "retrieval_head_attn" in meta
 
     def test_forward_with_padding(self) -> None:
         """Forward pass should handle padded grids (PAD_VALUE = -1)."""

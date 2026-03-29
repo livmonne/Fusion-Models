@@ -75,6 +75,8 @@ Demo Pairs (input/output grids)                Test Input Grid
        ┌──────┼────────────────┼──────────────────┐
        ▼      ▼                ▼                   ▼
   RuleMemory(x, h)    RuleGenerator(x, h)  GuessComponent(x, h, H, W)
+  (MH cross-attn
+   retrieval, 4 heads)
        │                    │                      │
   (B, seq, 10)        (B, seq, 10)           (B, seq, 10)
   + mem_repr (B,E)    + rule_repr (B,E)      + guess_repr (B,E)
@@ -112,7 +114,7 @@ Demo Pairs (input/output grids)                Test Input Grid
 | **Cell Embedding + Pos Enc** | Converts each grid cell (0–9) into a vector, adds 2-D positional info so the model knows where each cell sits. |
 | **Transformer Encoder** | Reads concatenated demo input+output pairs via self-attention so the model can understand *how* the input was transformed. |
 | **Multi-Head Cross-Attention** | Lets the test input tokens "ask questions" of the demo context — this is the core mechanism that transfers the inferred rule to the test input. |
-| **RuleMemory** | A persistent bank of 128 reusable low-rank rules, each with a learned trigger.  Rules are matched via soft attention and applied per-cell.  Slot strength decays and reinforces over time (biologically-inspired). |
+| **RuleMemory** | A persistent bank of 128 reusable low-rank rules, each with a learned trigger.  Rules are matched via **multi-head cross-attention** (4 heads by default) and applied per-cell.  Slot strength decays and reinforces over time (biologically-inspired). |
 | **RuleGenerator** | Invents a one-shot low-rank correction on the fly and maintains a history of past attempts to propose persistent rules for the memory bank. |
 | **GuessComponent** | A deep spatial predictor: a stack of Transformer layers that alternate between *local* (windowed) and *global* self-attention, with FiLM conditioning from the pooled task embedding `h`, followed by a per-cell MLP head. |
 | **DecisionRouter** | Uses multi-head cross-attention to decide how much weight each pathway gets.  Produces per-input routing coefficients `α ∈ [0, 1]³` that sum to 1. |
@@ -182,9 +184,40 @@ Each of the 128 memory slots stores:
 - A **classification head** — converts the corrected embedding into
   per-cell colour logits.
 
-**Retrieval** works by computing soft attention between the pooled
-embedding `h` and all slot keys.  The resulting scores determine how
-strongly each rule contributes.
+#### Multi-Head Cross-Attention Retrieval
+
+Retrieval uses **multi-head cross-attention** (4 heads by default) rather
+than a single dot-product.  The pooled task embedding `h` is the *query*;
+the slot keys serve as both *keys* and *values* through separate learned
+projections.
+
+```
+h  (B, E) ──► Q projection ──► Q (B, H, head_dim) ─┐
+                                                     ├─► scaled dot-product attention
+keys (S, E) ──► K projection ──► K (S, H, head_dim) ─┘
+            ──► V projection ──► V (S, H, head_dim)
+                                        │
+                          softmax per head → head_attn (B, H, S)
+                                │                    │
+                         weighted sum of V      learned head combination
+                                │                    │
+                        retrieved (B, H, D)     scores (B, S)
+                                │
+                    concat heads → out_proj → context (B, E)
+```
+
+**Why multiple heads?**  A single dot-product compresses "relevance" into
+one number per slot.  With *H* heads, the model gets *H* independent
+channels to assess relevance — one head might attend to colour
+transformations, another to spatial layout, a third to symmetry patterns.
+The per-head attention maps are merged into final slot scores via a
+*learned* head-combination vector (softmax over `H` learnable weights),
+so the model can up-weight the most informative heads over training.
+
+The cross-attention also produces a **context vector** (the standard MHA
+output) that is added to the mean-pooled blended correction and
+LayerNorm'd before being passed to the decision router.  This gives the
+router a richer signal about what the memory pathway found.
 
 **Memory strength** is modulated by two signals inspired by neuroscience:
 
