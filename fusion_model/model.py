@@ -38,9 +38,9 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
 
 from .decision import DecisionRouter
 from .guess import GuessComponent
@@ -48,9 +48,7 @@ from .memory import RuleMemory
 from .rule_engine import RuleGenerator
 
 
-def _sinusoidal_pos_encoding_2d(
-    max_h: int, max_w: int, embed_dim: int
-) -> jnp.ndarray:
+def _sinusoidal_pos_encoding_2d(max_h: int, max_w: int, embed_dim: int) -> jnp.ndarray:
     """Generate 2-D sinusoidal positional encodings.
 
     Returns an array of shape ``(max_h * max_w, embed_dim)`` where the
@@ -72,8 +70,10 @@ def _sinusoidal_pos_encoding_2d(
 
     # Broadcast: (H, 1, half) + (1, W, half) → (H, W, half)
     pe = jnp.concatenate(
-        [jnp.broadcast_to(pe_h[:, None, :], (max_h, max_w, half)),
-         jnp.broadcast_to(pe_w[None, :, :], (max_h, max_w, half))],
+        [
+            jnp.broadcast_to(pe_h[:, None, :], (max_h, max_w, half)),
+            jnp.broadcast_to(pe_w[None, :, :], (max_h, max_w, half)),
+        ],
         axis=-1,
     )  # (H, W, embed_dim)
     return pe.reshape(max_h * max_w, embed_dim)
@@ -81,6 +81,7 @@ def _sinusoidal_pos_encoding_2d(
 
 class TransformerEncoderLayer(nn.Module):
     """Single Transformer encoder layer with self-attention + FFN."""
+
     embed_dim: int = 256
     num_heads: int = 8
     dropout_rate: float = 0.1
@@ -108,13 +109,18 @@ class TransformerEncoderLayer(nn.Module):
 
 class CrossAttentionLayer(nn.Module):
     """Cross-attention layer: query attends to key/value context."""
+
     embed_dim: int = 256
     num_heads: int = 8
     dropout_rate: float = 0.1
 
     @nn.compact
     def __call__(
-        self, x: jnp.ndarray, context: jnp.ndarray, *, training: bool = False,
+        self,
+        x: jnp.ndarray,
+        context: jnp.ndarray,
+        *,
+        training: bool = False,
     ) -> jnp.ndarray:
         attended = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
@@ -160,7 +166,7 @@ class FusionModel(nn.Module):
     num_cross_attn_layers: int = 4
     num_attn_heads: int = 8
     num_rule_slots: int = 128
-    rule_rank: int = 16
+    rule_rank: int = 32
     history_size: int = 512
 
     def setup(self) -> None:
@@ -176,7 +182,9 @@ class FusionModel(nn.Module):
 
         # 2-D sinusoidal positional encoding (computed once, stored as constant).
         self.pos_encoding = _sinusoidal_pos_encoding_2d(
-            self.max_grid_size, self.max_grid_size, self.embed_dim,
+            self.max_grid_size,
+            self.max_grid_size,
+            self.embed_dim,
         )
 
         # ── Demo pair encoder (shared Transformer) ────────────────────────
@@ -226,7 +234,9 @@ class FusionModel(nn.Module):
     # ── Helper: embed a batch of grids ────────────────────────────────────
 
     def _embed_grid(
-        self, grid: jnp.ndarray, type_id: int,
+        self,
+        grid: jnp.ndarray,
+        type_id: int,
     ) -> jnp.ndarray:
         """Embed a padded grid into a sequence of token vectors.
 
@@ -315,9 +325,9 @@ class FusionModel(nn.Module):
         history_info = None
         if training:
             pred_cells = jax.lax.stop_gradient(logits.argmax(axis=-1))
-            decisions = (
-                pred_cells.sum(axis=-1) % self.rule_gen.decision_vocab_size
-            ).astype(jnp.int32)
+            decisions = (pred_cells.sum(axis=-1) % self.rule_gen.decision_vocab_size).astype(
+                jnp.int32
+            )
             h_det = jax.lax.stop_gradient(h)
             history_info = {"h": h_det, "decisions": decisions}
 

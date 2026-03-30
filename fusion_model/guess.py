@@ -26,8 +26,8 @@ a mechanical cell-by-cell procedure.
 
 from __future__ import annotations
 
-import jax.numpy as jnp
 import flax.linen as nn
+import jax.numpy as jnp
 
 
 def _local_attention_mask(grid_size: int, window_size: int) -> jnp.ndarray:
@@ -99,7 +99,8 @@ class _GuessTransformerLayer(nn.Module):
             name="self_attn",
         )(x, x, mask=mask)
         attended = nn.Dropout(
-            self.dropout_rate, deterministic=not training,
+            self.dropout_rate,
+            deterministic=not training,
         )(attended)
         x = nn.LayerNorm(name="attn_norm")(x + attended)
 
@@ -107,11 +108,13 @@ class _GuessTransformerLayer(nn.Module):
         ffn = nn.Dense(self.embed_dim * self.ffn_mult, name="ffn_dense1")(x)
         ffn = nn.gelu(ffn)
         ffn = nn.Dropout(
-            self.dropout_rate, deterministic=not training,
+            self.dropout_rate,
+            deterministic=not training,
         )(ffn)
         ffn = nn.Dense(self.embed_dim, name="ffn_dense2")(ffn)
         ffn = nn.Dropout(
-            self.dropout_rate, deterministic=not training,
+            self.dropout_rate,
+            deterministic=not training,
         )(ffn)
         x = nn.LayerNorm(name="ffn_norm")(x + ffn)
 
@@ -179,7 +182,8 @@ class GuessComponent(nn.Module):
         hidden = nn.Dense(self.embed_dim, name="head_dense1")(x)
         hidden = nn.gelu(hidden)
         hidden = nn.Dropout(
-            self.dropout_rate, deterministic=not training,
+            self.dropout_rate,
+            deterministic=not training,
         )(hidden)
         logits_guess = nn.Dense(self.num_colours, name="head_dense2")(hidden)
 
