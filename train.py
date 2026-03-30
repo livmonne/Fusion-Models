@@ -178,6 +178,73 @@ class FusionTrainState(train_state.TrainState):
     rng: jax.Array = None
 
 
+def _update_history_buffer(model_state, h, decisions, outcomes):
+    """Write a batch of (h, decision, outcome) triples into the history buffer.
+
+    Operates directly on the model-state dict returned by the forward pass,
+    returning a new dict with the rule_gen history arrays updated.
+    """
+    rg = model_state["rule_gen"]
+
+    history_h = rg["history_h"]
+    history_decisions = rg["history_decisions"]
+    history_outcomes = rg["history_outcomes"]
+    ptr = rg["history_ptr"]
+    count = rg["history_count"]
+    history_size = history_h.shape[0]
+
+    batch = h.shape[0]
+
+    def _write_one(carry, i):
+        hh, hd, ho = carry
+        idx = (ptr + i) % history_size
+        hh = hh.at[idx].set(h[i])
+        hd = hd.at[idx].set(decisions[i])
+        ho = ho.at[idx].set(outcomes[i])
+        return (hh, hd, ho), None
+
+    (history_h, history_decisions, history_outcomes), _ = jax.lax.scan(
+        _write_one,
+        (history_h, history_decisions, history_outcomes),
+        jnp.arange(batch),
+    )
+
+    new_rg = type(rg)({
+        **rg,
+        "history_h": history_h,
+        "history_decisions": history_decisions,
+        "history_outcomes": history_outcomes,
+        "history_ptr": (ptr + batch) % history_size,
+        "history_count": jnp.minimum(count + batch, history_size),
+    })
+    return type(model_state)({**model_state, "rule_gen": new_rg})
+
+
+def _apply_commitment(params, commit_info):
+    """Blend a proposed rule into the weakest memory slot's parameters.
+
+    Called after gradient updates so the commitment doesn't interfere
+    with backprop.  When ``commit_info["weight"]`` is near zero the
+    blending is effectively a no-op.
+    """
+    w = commit_info["weight"]
+    slot = commit_info["slot"]
+
+    mem = params["memory"]
+    new_keys = mem["keys"].at[slot].set(
+        mem["keys"][slot] * (1 - w) + commit_info["key"] * w
+    )
+    new_A = mem["A"].at[slot].set(
+        mem["A"][slot] * (1 - w) + commit_info["A"] * w
+    )
+    new_B = mem["B"].at[slot].set(
+        mem["B"][slot] * (1 - w) + commit_info["B"] * w
+    )
+
+    new_mem = type(mem)({**mem, "keys": new_keys, "A": new_A, "B": new_B})
+    return type(params)({**params, "memory": new_mem})
+
+
 # ── Training step (JIT-compiled) ─────────────────────────────────────────────
 
 
@@ -224,17 +291,42 @@ def train_step(
             pad_value=PAD_VALUE,
         )
 
-        return total_loss, (loss_dict, logits, alphas, targets_flat, mutated)
+        commit_info = meta.get("commit_info")
+        history_info = meta.get("history_info")
+        return total_loss, (
+            loss_dict, logits, alphas, targets_flat, mutated, commit_info, history_info,
+        )
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (loss_dict, logits, alphas, targets_flat, mutated)), grads = grad_fn(state.params)
+    (loss, (loss_dict, logits, alphas, targets_flat, mutated, commit_info, history_info)), grads = (
+        grad_fn(state.params)
+    )
+
+    # Compute per-sample cross-entropy as the history outcome signal.
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    target_safe = jnp.where(targets_flat == PAD_VALUE, 0, targets_flat)
+    target_log_probs = jnp.take_along_axis(
+        log_probs, target_safe[:, :, None], axis=-1,
+    ).squeeze(-1)
+    valid_mask = (targets_flat != PAD_VALUE).astype(jnp.float32)
+    per_sample_loss = -(target_log_probs * valid_mask).sum(axis=-1) / jnp.maximum(
+        valid_mask.sum(axis=-1), 1.0,
+    )
+
+    # Write (h, decision, per-sample loss) into the circular history buffer.
+    model_state = mutated.get("state")
+    if history_info is not None:
+        model_state = _update_history_buffer(
+            model_state, history_info["h"], history_info["decisions"], per_sample_loss,
+        )
 
     # Grad clipping is handled by the optimizer chain — no manual clip here.
     state = state.apply_gradients(grads=grads)
-    state = state.replace(
-        model_state=mutated.get("state"),
-        rng=rng,
-    )
+    state = state.replace(model_state=model_state, rng=rng)
+
+    # Apply param-side rule commitment (state-side was handled in the forward pass).
+    if commit_info is not None:
+        state = state.replace(params=_apply_commitment(state.params, commit_info))
 
     # Compute accuracy (stays as jnp scalars inside JIT).
     preds = logits.argmax(axis=-1)

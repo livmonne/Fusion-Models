@@ -310,6 +310,31 @@ class FusionModel(nn.Module):
             + alpha[:, 2:3, None] * logits_guess
         )  # (B, seq, num_colours)
 
+        # ── 7. History staging & rule commitment (training only) ─────────
+        commit_info = None
+        history_info = None
+        if training:
+            pred_cells = jax.lax.stop_gradient(logits.argmax(axis=-1))
+            decisions = (
+                pred_cells.sum(axis=-1) % self.rule_gen.decision_vocab_size
+            ).astype(jnp.int32)
+            h_det = jax.lax.stop_gradient(h)
+            history_info = {"h": h_det, "decisions": decisions}
+
+            weights = proposal["commit_weight"]  # (B, 1)
+            best_idx = jnp.argmax(weights[:, 0])
+            w = jax.lax.stop_gradient(weights[best_idx, 0])
+            slot_idx = self.memory.get_weakest_slot_jit()
+            self.memory.apply_commitment_state(slot_idx, w)
+
+            commit_info = {
+                "slot": slot_idx,
+                "key": jax.lax.stop_gradient(proposal["key"][best_idx]),
+                "A": jax.lax.stop_gradient(proposal["A"][best_idx]),
+                "B": jax.lax.stop_gradient(proposal["B"][best_idx]),
+                "weight": w,
+            }
+
         metadata: dict[str, Any] = {
             "logits_mem": logits_mem,
             "logits_rule": logits_rule,
@@ -320,5 +345,7 @@ class FusionModel(nn.Module):
             "rule_confidence": confidence,
             "router_attn": router_attn,
             "proposal": proposal,
+            "commit_info": commit_info,
+            "history_info": history_info,
         }
         return logits, alpha, metadata

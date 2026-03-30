@@ -359,6 +359,41 @@ class RuleMemory(nn.Module):
         combined = strength + 1e-6 * self._utility.value
         return int(jnp.argmin(combined).item())
 
+    def get_weakest_slot_jit(self) -> jnp.ndarray:
+        """Return the index of the weakest slot as a JAX int32 scalar.
+
+        Unlike :meth:`get_weakest_slot`, this variant returns a JAX array
+        instead of a Python int, making it safe to use inside
+        ``jax.jit``-compiled functions.
+        """
+        strength = self.get_strength()
+        combined = strength + 1e-6 * self._utility.value
+        return jnp.argmin(combined).astype(jnp.int32)
+
+    def apply_commitment_state(
+        self, slot_idx: jnp.ndarray, w: jnp.ndarray,
+    ) -> None:
+        """Apply state-side updates for committing a proposed rule to a slot.
+
+        Updates the slot's utility, frequency, and recency state.  When
+        ``w`` is near zero the updates are effectively no-ops, avoiding
+        the need for data-dependent branching inside JIT.
+
+        :param slot_idx: Target slot index (JAX int32 scalar).
+        :param w: Commit weight in ``[0, 1]`` (JAX float scalar).
+        """
+        self._utility.value = self._utility.value.at[slot_idx].set(
+            self._utility.value[slot_idx] * (1.0 - w)
+        )
+        self._frequency.value = self._frequency.value.at[slot_idx].set(
+            jnp.maximum(w, self._frequency.value[slot_idx])
+        )
+        self._steps_since_activation.value = (
+            self._steps_since_activation.value.at[slot_idx].set(
+                self._steps_since_activation.value[slot_idx] * (1.0 - w)
+            )
+        )
+
     # ── Rule commitment ──────────────────────────────────────────────────
 
     def commit_rule(
