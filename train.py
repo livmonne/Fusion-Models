@@ -388,8 +388,8 @@ def train_fusion(
                 f"loss={train_loss:.4f}  train_acc={train_acc:.3f}  "
                 f"val_acc={val_acc:.3f}{alpha_str}"
             )
-        if aux_str:
-            print(f"  pathway losses: {aux_str}")
+            if aux_str:
+                print(f"  pathway losses: {aux_str}")
 
         # ── Periodic checkpoint ───────────────────────────────────────
         if jax.process_index() == 0 and epoch % args.ckpt_every == 0:
