@@ -173,9 +173,9 @@ class RuleMemory(nn.Module):
     num_slots: int = 16
     rank: int = 16
     num_retrieval_heads: int = 8
-    prune_threshold: float = 0.05
+    prune_threshold: float = 0.08
     prune_every_n_steps: int = 100
-    recency_activation_threshold: float = 0.1
+    recency_activation_threshold: float = 0.0039
 
     def setup(self) -> None:
         # --- Learnable rule bank ---
@@ -230,7 +230,7 @@ class RuleMemory(nn.Module):
         self._frequency = self.variable(
             "state",
             "frequency",
-            lambda: jnp.full((self.num_slots,), 0.5),
+            lambda: jnp.full((self.num_slots,), 0.1),
         )
         self._steps_since_activation = self.variable(
             "state",
@@ -371,7 +371,9 @@ class RuleMemory(nn.Module):
         return jnp.argmin(combined).astype(jnp.int32)
 
     def apply_commitment_state(
-        self, slot_idx: jnp.ndarray, w: jnp.ndarray,
+        self,
+        slot_idx: jnp.ndarray,
+        w: jnp.ndarray,
     ) -> None:
         """Apply state-side updates for committing a proposed rule to a slot.
 
@@ -388,10 +390,8 @@ class RuleMemory(nn.Module):
         self._frequency.value = self._frequency.value.at[slot_idx].set(
             jnp.maximum(w, self._frequency.value[slot_idx])
         )
-        self._steps_since_activation.value = (
-            self._steps_since_activation.value.at[slot_idx].set(
-                self._steps_since_activation.value[slot_idx] * (1.0 - w)
-            )
+        self._steps_since_activation.value = self._steps_since_activation.value.at[slot_idx].set(
+            self._steps_since_activation.value[slot_idx] * (1.0 - w)
         )
 
     # ── Rule commitment ──────────────────────────────────────────────────
