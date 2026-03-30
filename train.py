@@ -33,7 +33,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax.training import train_state
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from fusion_model import FusionModel
 from fusion_model.loss import fusion_loss
@@ -120,9 +121,7 @@ def _replicate_state(
         if isinstance(x, (np.ndarray, jnp.ndarray, jax.Array)):
             arr = np.asarray(x)
             local_arrays = [jax.device_put(jnp.array(arr), d) for d in local_devices]
-            return jax.make_array_from_single_device_arrays(
-                arr.shape, replicated, local_arrays
-            )
+            return jax.make_array_from_single_device_arrays(arr.shape, replicated, local_arrays)
         return x
 
     return jax.tree.map(_replicate, state)
@@ -174,6 +173,7 @@ def prefetch_to_device(
 
 class FusionTrainState(train_state.TrainState):
     """Extended train state that carries mutable model state (buffers)."""
+
     model_state: Any = None
     rng: jax.Array = None
 
@@ -216,7 +216,9 @@ def train_step(
         targets_flat = targets_flat[:, :max_cells]
 
         total_loss, loss_dict = fusion_loss(
-            logits, targets_flat, alphas,
+            logits,
+            targets_flat,
+            alphas,
             meta["retrieval_scores"],
             metadata=meta,
             pad_value=PAD_VALUE,
@@ -333,8 +335,7 @@ def train_fusion(
     accum_steps = args.grad_accum // args.batch_size
 
     print(
-        f"Effective batch size: {args.grad_accum} "
-        f"(micro={args.batch_size} x accum={accum_steps})"
+        f"Effective batch size: {args.grad_accum} (micro={args.batch_size} x accum={accum_steps})"
     )
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -381,11 +382,12 @@ def train_fusion(
                 f"rule={last_aux['rule']:.4f}  "
                 f"guess={last_aux['guess']:.4f}"
             )
-        print(
-            f"Epoch {epoch:3d}/{args.epochs}  "
-            f"loss={train_loss:.4f}  train_acc={train_acc:.3f}  "
-            f"val_acc={val_acc:.3f}{alpha_str}"
-        )
+        if jax.process_index() == 0:
+            print(
+                f"Epoch {epoch:3d}/{args.epochs}  "
+                f"loss={train_loss:.4f}  train_acc={train_acc:.3f}  "
+                f"val_acc={val_acc:.3f}{alpha_str}"
+            )
         if aux_str:
             print(f"  pathway losses: {aux_str}")
 
@@ -443,7 +445,9 @@ def main() -> None:
     parser.add_argument("--parquet_files", type=str, nargs="+", default=None)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument(
-        "--grad_accum", type=int, default=None,
+        "--grad_accum",
+        type=int,
+        default=None,
         help="Effective batch size for gradient accumulation.",
     )
     parser.add_argument("--epochs", type=int, default=40)
@@ -452,11 +456,16 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--out_dir", type=str, default="outputs")
     parser.add_argument(
-        "--resume", type=str, default=None, metavar="PATH",
+        "--resume",
+        type=str,
+        default=None,
+        metavar="PATH",
         help="Path to a checkpoint file to resume training from.",
     )
     parser.add_argument(
-        "--ckpt_every", type=int, default=1,
+        "--ckpt_every",
+        type=int,
+        default=1,
         help="Save a full checkpoint every N epochs (default: every epoch).",
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -472,10 +481,16 @@ def main() -> None:
     if args.grad_accum is None:
         args.grad_accum = args.batch_size
     if args.grad_accum < args.batch_size:
-        print(f"Error: --grad_accum ({args.grad_accum}) must be >= --batch_size ({args.batch_size}).", file=sys.stderr)
+        print(
+            f"Error: --grad_accum ({args.grad_accum}) must be >= --batch_size ({args.batch_size}).",
+            file=sys.stderr,
+        )
         sys.exit(1)
     if args.grad_accum % args.batch_size != 0:
-        print(f"Error: --grad_accum ({args.grad_accum}) must be divisible by --batch_size ({args.batch_size}).", file=sys.stderr)
+        print(
+            f"Error: --grad_accum ({args.grad_accum}) must be divisible by --batch_size ({args.batch_size}).",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # ── Validate parquet args ─────────────────────────────────────────────
@@ -486,8 +501,8 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
 
     # ── Multi-device mesh setup ────────────────────────────────────────
-    num_devices = jax.device_count()          # total across all hosts
-    num_processes = jax.process_count()       # number of hosts
+    num_devices = jax.device_count()  # total across all hosts
+    num_processes = jax.process_count()  # number of hosts
     mesh = Mesh(np.array(jax.devices()), axis_names=("data",))
     data_sharding = NamedSharding(mesh, P("data"))
     replicated = NamedSharding(mesh, P())
@@ -499,8 +514,12 @@ def main() -> None:
 
     # Batch size must be divisible by the number of devices.
     if args.batch_size % num_devices != 0:
-        new_bs = max(num_devices, ((args.batch_size + num_devices - 1) // num_devices) * num_devices)
-        print(f"Adjusting --batch_size {args.batch_size} → {new_bs} (divisible by {num_devices} devices)")
+        new_bs = max(
+            num_devices, ((args.batch_size + num_devices - 1) // num_devices) * num_devices
+        )
+        print(
+            f"Adjusting --batch_size {args.batch_size} → {new_bs} (divisible by {num_devices} devices)"
+        )
         args.batch_size = new_bs
         # Re-validate grad_accum after adjustment.
         if args.grad_accum % args.batch_size != 0:
@@ -588,8 +607,12 @@ def main() -> None:
 
     schedule = optax.join_schedules(
         schedules=[
-            optax.linear_schedule(init_value=args.lr * 0.01, end_value=args.lr, transition_steps=max(1, warmup_steps)),
-            optax.cosine_decay_schedule(init_value=args.lr, decay_steps=max(1, total_steps - warmup_steps)),
+            optax.linear_schedule(
+                init_value=args.lr * 0.01, end_value=args.lr, transition_steps=max(1, warmup_steps)
+            ),
+            optax.cosine_decay_schedule(
+                init_value=args.lr, decay_steps=max(1, total_steps - warmup_steps)
+            ),
         ],
         boundaries=[warmup_steps],
     )
@@ -617,8 +640,16 @@ def main() -> None:
             ckpt = pickle.load(f)
 
         saved_args = ckpt.get("args", {})
-        for key in ("lr", "weight_decay", "epochs", "batch_size", "embed_dim",
-                     "num_encoder_layers", "num_cross_attn_layers", "max_grid_size"):
+        for key in (
+            "lr",
+            "weight_decay",
+            "epochs",
+            "batch_size",
+            "embed_dim",
+            "num_encoder_layers",
+            "num_cross_attn_layers",
+            "max_grid_size",
+        ):
             saved_val = saved_args.get(key)
             current_val = getattr(args, key, None)
             if saved_val is not None and current_val != saved_val:
@@ -639,15 +670,20 @@ def main() -> None:
             "history": ckpt["history"],
             "np_rng_state": ckpt["np_rng_state"],
         }
-        print(f"  Resuming from epoch {start_epoch}, step {ckpt['step']}, "
-              f"best_val_acc={ckpt['best_val_acc']:.4f}")
+        print(
+            f"  Resuming from epoch {start_epoch}, step {ckpt['step']}, "
+            f"best_val_acc={ckpt['best_val_acc']:.4f}"
+        )
 
     # Replicate state across all devices for data parallelism (multi-host safe).
     state = _replicate_state(state, replicated)
 
     print("Training... (first step will be slow due to JIT compilation)")
     state, history = train_fusion(
-        state, train_ds, val_ds, args,
+        state,
+        train_ds,
+        val_ds,
+        args,
         data_sharding=data_sharding,
         start_epoch=start_epoch,
         resume_state=resume_state,
