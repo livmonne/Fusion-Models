@@ -64,6 +64,9 @@ class RuleGenerator(nn.Module):
         self.mlp_dense2 = nn.Dense(out_dim)
         # Per-token classification head.
         self.head = nn.Dense(self.num_colours)
+        self.correction_scale = self.param(
+            "correction_scale", lambda _rng, _shape: jnp.array(0.01), (),
+        )
 
         # ── Rule proposer ────────────────────────────────────────────────
         self.decision_embed = nn.Embed(self.decision_vocab_size, self.decision_embed_dim)
@@ -285,6 +288,7 @@ class RuleGenerator(nn.Module):
         correction = jnp.transpose(
             jnp.matmul(a_mat, compressed), (0, 2, 1),
         )  # (B, seq, E)
+        correction = correction * self.correction_scale
 
         logits_rule = self.head(correction)  # (B, seq, num_colours)
 
