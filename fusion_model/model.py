@@ -165,8 +165,8 @@ class FusionModel(nn.Module):
     num_encoder_layers: int = 4
     num_cross_attn_layers: int = 4
     num_attn_heads: int = 8
-    num_rule_slots: int = 128
-    rule_rank: int = 16
+    num_rule_slots: int = 32
+    rule_rank: int = 32
     history_size: int = 512
 
     def setup(self) -> None:
