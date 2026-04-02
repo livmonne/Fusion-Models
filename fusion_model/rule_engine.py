@@ -18,11 +18,9 @@ distill recurring patterns into the long-term rule bank.
 
 from __future__ import annotations
 
-from typing import Any
-
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
 
 
 class RuleGenerator(nn.Module):
@@ -65,24 +63,30 @@ class RuleGenerator(nn.Module):
         # Per-token classification head.
         self.head = nn.Dense(self.num_colours)
         self.correction_scale = self.param(
-            "correction_scale", lambda _rng, _shape: jnp.array(0.01), (),
+            "correction_scale",
+            lambda _rng, _shape: jnp.array(0.01),
+            (),
         )
 
         # ── Rule proposer ────────────────────────────────────────────────
         self.decision_embed = nn.Embed(self.decision_vocab_size, self.decision_embed_dim)
 
         self.input_dec_cross_attn = nn.MultiHeadDotProductAttention(
-            num_heads=4, qkv_features=self.embed_dim,
+            num_heads=4,
+            qkv_features=self.embed_dim,
         )
         self.dec_proj = nn.Dense(self.embed_dim)
 
-        self.outcome_proj = nn.Sequential([
-            nn.Dense(self.outcome_proj_dim),
-            nn.gelu,
-            nn.Dense(self.embed_dim),
-        ])
+        self.outcome_proj = nn.Sequential(
+            [
+                nn.Dense(self.outcome_proj_dim),
+                nn.gelu,
+                nn.Dense(self.embed_dim),
+            ]
+        )
         self.outcome_cross_attn = nn.MultiHeadDotProductAttention(
-            num_heads=4, qkv_features=self.embed_dim,
+            num_heads=4,
+            qkv_features=self.embed_dim,
         )
 
         self.synthesis_query = self.param(
@@ -91,38 +95,48 @@ class RuleGenerator(nn.Module):
             (1, 1, self.embed_dim),
         )
         self.synthesis_cross_attn = nn.MultiHeadDotProductAttention(
-            num_heads=4, qkv_features=self.embed_dim,
+            num_heads=4,
+            qkv_features=self.embed_dim,
         )
 
         proposer_out = self.embed_dim + (self.embed_dim * self.rank) + (self.rank * self.embed_dim)
         self.rule_proj = nn.Dense(proposer_out)
 
         self.commit_threshold_logit = self.param(
-            "commit_threshold_logit", lambda _rng, _shape: jnp.array(0.0), (),
+            "commit_threshold_logit",
+            lambda _rng, _shape: jnp.array(0.0),
+            (),
         )
         self.commit_temperature = self.param(
-            "commit_temperature", lambda _rng, _shape: jnp.array(1.0), (),
+            "commit_temperature",
+            lambda _rng, _shape: jnp.array(1.0),
+            (),
         )
 
         # ── Mutable state (history buffer) ───────────────────────────────
         self._history_h = self.variable(
-            "state", "history_h",
+            "state",
+            "history_h",
             lambda: jnp.zeros((self.history_size, self.embed_dim)),
         )
         self._history_decisions = self.variable(
-            "state", "history_decisions",
+            "state",
+            "history_decisions",
             lambda: jnp.full((self.history_size,), -1, dtype=jnp.int32),
         )
         self._history_outcomes = self.variable(
-            "state", "history_outcomes",
+            "state",
+            "history_outcomes",
             lambda: jnp.zeros((self.history_size,)),
         )
         self._history_ptr = self.variable(
-            "state", "history_ptr",
+            "state",
+            "history_ptr",
             lambda: jnp.array(0, dtype=jnp.int32),
         )
         self._history_count = self.variable(
-            "state", "history_count",
+            "state",
+            "history_count",
             lambda: jnp.array(0, dtype=jnp.int32),
         )
 
@@ -166,7 +180,8 @@ class RuleGenerator(nn.Module):
         self._history_outcomes.value = history_outcomes
         self._history_ptr.value = (ptr + batch) % self.history_size
         self._history_count.value = jnp.minimum(
-            self._history_count.value + batch, self.history_size,
+            self._history_count.value + batch,
+            self.history_size,
         )
 
     # ── Rule proposal ────────────────────────────────────────────────────
@@ -182,32 +197,35 @@ class RuleGenerator(nn.Module):
         count = self._history_count.value
         n = self.history_size
 
-        history_h = self._history_h.value              # (n, embed_dim)
+        history_h = self._history_h.value  # (n, embed_dim)
         history_decisions = self._history_decisions.value  # (n,)
-        history_outcomes = self._history_outcomes.value    # (n,)
+        history_outcomes = self._history_outcomes.value  # (n,)
 
         # Mask invalid (unfilled) buffer slots.
-        valid_mask = jnp.arange(n) < count              # (n,)
+        valid_mask = jnp.arange(n) < count  # (n,)
         history_h = history_h * valid_mask[:, None]
         # Replace -1 sentinel in unfilled decision slots with 0 (valid embed index).
         history_decisions = jnp.where(valid_mask, history_decisions, 0)
         history_outcomes = history_outcomes * valid_mask
 
         hist_h = jnp.broadcast_to(
-            history_h[None, :, :], (batch_size, n, self.embed_dim),
+            history_h[None, :, :],
+            (batch_size, n, self.embed_dim),
         )
 
         # Stage 1: historical inputs cross-attend over historical decisions.
         dec_emb = self.dec_proj(self.decision_embed(history_decisions))
         kv_dec = jnp.broadcast_to(
-            dec_emb[None, :, :], (batch_size, n, self.embed_dim),
+            dec_emb[None, :, :],
+            (batch_size, n, self.embed_dim),
         )
         attended_input_dec = self.input_dec_cross_attn(hist_h, kv_dec)
 
         # Stage 2: input→decision result cross-attends over outcome embeddings.
         outcome_emb = self.outcome_proj(history_outcomes[:, None])
         kv_out = jnp.broadcast_to(
-            outcome_emb[None, :, :], (batch_size, n, self.embed_dim),
+            outcome_emb[None, :, :],
+            (batch_size, n, self.embed_dim),
         )
         attended_outcome = self.outcome_cross_attn(attended_input_dec, kv_out)
 
@@ -216,7 +234,8 @@ class RuleGenerator(nn.Module):
 
         # Stage 3: learned synthesis query attends over the two pooled results.
         context_tokens = jnp.stack(
-            [attended_input_dec_pooled, attended_outcome_pooled], axis=1,
+            [attended_input_dec_pooled, attended_outcome_pooled],
+            axis=1,
         )
         syn_query = jnp.broadcast_to(self.synthesis_query, (batch_size, 1, self.embed_dim))
         synthesised = self.synthesis_cross_attn(syn_query, context_tokens)
@@ -235,9 +254,8 @@ class RuleGenerator(nn.Module):
         mean_hist = history_h.mean(axis=0, keepdims=True)
         mean_hist = jnp.broadcast_to(mean_hist, (batch_size, e))
         # Cosine similarity.
-        similarity = (
-            (key * mean_hist).sum(axis=-1)
-            / (jnp.linalg.norm(key, axis=-1) * jnp.linalg.norm(mean_hist, axis=-1) + 1e-8)
+        similarity = (key * mean_hist).sum(axis=-1) / (
+            jnp.linalg.norm(key, axis=-1) * jnp.linalg.norm(mean_hist, axis=-1) + 1e-8
         )
         threshold = jax.nn.sigmoid(self.commit_threshold_logit)
         temperature = jnp.clip(self.commit_temperature, min=0.01)
@@ -259,7 +277,11 @@ class RuleGenerator(nn.Module):
     # ── Forward pass ─────────────────────────────────────────────────────
 
     def __call__(
-        self, x: jnp.ndarray, h: jnp.ndarray, *, training: bool = False,
+        self,
+        x: jnp.ndarray,
+        h: jnp.ndarray,
+        *,
+        training: bool = False,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, dict[str, jnp.ndarray]]:
         """Produce per-token ephemeral rule logits, confidence, repr, and a rule proposal.
 
@@ -280,13 +302,14 @@ class RuleGenerator(nn.Module):
         a_flat = params[:, b_size : b_size + a_size]
         confidence = jax.nn.sigmoid(params[:, -1:])
 
-        b_mat = b_flat.reshape(batch, self.rank, self.embed_dim)       # (B, r, E)
-        a_mat = a_flat.reshape(batch, self.embed_dim, self.rank)       # (B, E, r)
+        b_mat = b_flat.reshape(batch, self.rank, self.embed_dim)  # (B, r, E)
+        a_mat = a_flat.reshape(batch, self.embed_dim, self.rank)  # (B, E, r)
 
         # Per-token correction: A @ (B @ x_token) for every token.
         compressed = jnp.matmul(b_mat, jnp.transpose(x, (0, 2, 1)))  # (B, r, seq)
         correction = jnp.transpose(
-            jnp.matmul(a_mat, compressed), (0, 2, 1),
+            jnp.matmul(a_mat, compressed),
+            (0, 2, 1),
         )  # (B, seq, E)
         correction = correction * self.correction_scale
 
