@@ -100,26 +100,20 @@ class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        """Return a single sample as a dict of minimally-padded tensors.
+    def _build_sample_tensors(
+        self, sample: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        """Convert a raw sample dict into minimally-padded tensors.
 
-        Grids are padded to the sample's own max dimensions (not the global
-        max).  A custom collate function (:func:`arc_collate_fn`) re-pads
-        to the batch maximum at collation time.
+        This is the core tensor-building logic shared by all dataset
+        variants.  It is factored out of ``__getitem__`` so that
+        :class:`ParquetARCDataset` can call it directly from a local
+        variable without mutating ``self.samples``.
 
-        Keys returned:
-
-        * ``demo_inputs``  — ``(max_demos, H, W)`` padded demo input grids
-        * ``demo_outputs`` — ``(max_demos, H, W)`` padded demo output grids
-        * ``demo_mask``    — ``(max_demos,)`` boolean; True for real demos
-        * ``test_input``   — ``(H, W)`` padded test input grid
-        * ``test_output``  — ``(H, W)`` padded test output grid (or all PAD)
-        * ``input_size``   — ``(2,)`` int tensor ``[H, W]`` of test input
-        * ``output_size``  — ``(2,)`` int tensor ``[H, W]`` of test output
-        * ``grid_dims``    — ``(2,)`` int tensor ``[H, W]`` of padded dims
+        :param sample: Dict with keys ``demos``, ``test_input``, and
+            ``test_output`` (may be ``None``).
+        :return: Dict of padded tensors (see :meth:`__getitem__`).
         """
-        sample = self.samples[idx]
-
         # Compute per-sample max grid dims across all grids.
         all_grids: list[list[list[int]]] = []
         for demo in sample["demos"][: self.max_demos]:
@@ -173,6 +167,26 @@ class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
             "output_size": torch.tensor([to_h, to_w], dtype=torch.long),
             "grid_dims": torch.tensor([sample_h, sample_w], dtype=torch.long),
         }
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        """Return a single sample as a dict of minimally-padded tensors.
+
+        Grids are padded to the sample's own max dimensions (not the global
+        max).  A custom collate function (:func:`arc_collate_fn`) re-pads
+        to the batch maximum at collation time.
+
+        Keys returned:
+
+        * ``demo_inputs``  — ``(max_demos, H, W)`` padded demo input grids
+        * ``demo_outputs`` — ``(max_demos, H, W)`` padded demo output grids
+        * ``demo_mask``    — ``(max_demos,)`` boolean; True for real demos
+        * ``test_input``   — ``(H, W)`` padded test input grid
+        * ``test_output``  — ``(H, W)`` padded test output grid (or all PAD)
+        * ``input_size``   — ``(2,)`` int tensor ``[H, W]`` of test input
+        * ``output_size``  — ``(2,)`` int tensor ``[H, W]`` of test output
+        * ``grid_dims``    — ``(2,)`` int tensor ``[H, W]`` of padded dims
+        """
+        return self._build_sample_tensors(self.samples[idx])
 
 
 # ── JSON dataset ─────────────────────────────────────────────────────────────
@@ -377,7 +391,13 @@ class ParquetARCDataset(_BaseARCDataset):
         return len(self._index)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        """Parse one task on-the-fly and return padded tensors."""
+        """Parse one task on-the-fly and return padded tensors.
+
+        Instead of mutating ``self.samples`` (which would be a race
+        condition under multi-threaded access), we directly call the
+        base class's ``__getitem__`` with the sample dict stashed in a
+        local variable via a brief, thread-safe override.
+        """
         t_idx, row_idx, tp_idx = self._index[idx]
         table = self._tables[t_idx]
 
@@ -391,11 +411,10 @@ class ParquetARCDataset(_BaseARCDataset):
             "test_output": task["test"][tp_idx].get("output"),
         }
 
-        # Temporarily stash sample for base class __getitem__.
-        self.samples = [sample]
-        result = super().__getitem__(0)
-        self.samples = []
-        return result
+        # Build the tensor dict directly using the same logic as the
+        # base class, but from a local variable instead of mutating
+        # self.samples (which is not thread-safe).
+        return self._build_sample_tensors(sample)
 
 
 # ── Collate function ────────────────────────────────────────────────────────

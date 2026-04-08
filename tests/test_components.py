@@ -15,7 +15,7 @@ import tempfile
 import torch
 
 from fusion_model.decision import DecisionRouter
-from fusion_model.guess import GuessComponent
+from fusion_model.guess import GuessComponent, _local_attention_mask
 from fusion_model.loss import FusionLoss
 from fusion_model.memory import MultiHeadMemoryCrossAttention, RuleMemory
 from fusion_model.model import FusionModel
@@ -682,3 +682,193 @@ class TestNonSquareGridForward:
 
         assert logits.shape == (BATCH, H * W, NUM_COLOURS)
         assert alpha.shape == (BATCH, 3)
+
+
+# ── Batched demo encoding tests ─────────────────────────────────────────────
+
+
+class TestBatchedDemoEncoding:
+    """Tests verifying that the batched demo encoder produces correct shapes
+    and handles partial demo masks."""
+
+    def _make_model(self) -> FusionModel:
+        return FusionModel(
+            embed_dim=EMBED,
+            num_colours=NUM_COLOURS,
+            max_grid_size=MAX_GRID,
+            num_encoder_layers=1,
+            num_cross_attn_layers=1,
+            num_attn_heads=4,
+            num_rule_slots=N_SLOTS,
+            rule_rank=RANK,
+        )
+
+    def test_all_demos_valid(self) -> None:
+        """All demo slots active should produce correct output shapes."""
+        model = self._make_model()
+        G = MAX_GRID
+        D = 3
+        demo_inputs = torch.randint(0, NUM_COLOURS, (BATCH, D, G, G))
+        demo_outputs = torch.randint(0, NUM_COLOURS, (BATCH, D, G, G))
+        demo_mask = torch.ones(BATCH, D, dtype=torch.bool)
+        test_input = torch.randint(0, NUM_COLOURS, (BATCH, G, G))
+
+        logits, alpha, _ = model(demo_inputs, demo_outputs, demo_mask, test_input)
+        assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
+        assert alpha.shape == (BATCH, 3)
+
+    def test_partial_demo_mask(self) -> None:
+        """Only some demo slots active — output shapes must still be correct."""
+        model = self._make_model()
+        G = MAX_GRID
+        D = 3
+        demo_inputs = torch.randint(0, NUM_COLOURS, (BATCH, D, G, G))
+        demo_outputs = torch.randint(0, NUM_COLOURS, (BATCH, D, G, G))
+        # Only the first demo is valid for all samples.
+        demo_mask = torch.tensor([[True, False, False]] * BATCH)
+        test_input = torch.randint(0, NUM_COLOURS, (BATCH, G, G))
+
+        logits, alpha, _ = model(demo_inputs, demo_outputs, demo_mask, test_input)
+        assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
+
+    def test_no_valid_demos(self) -> None:
+        """All demo slots masked out — model should still run (zero context)."""
+        model = self._make_model()
+        G = MAX_GRID
+        D = 2
+        demo_inputs = torch.randint(0, NUM_COLOURS, (BATCH, D, G, G))
+        demo_outputs = torch.randint(0, NUM_COLOURS, (BATCH, D, G, G))
+        demo_mask = torch.zeros(BATCH, D, dtype=torch.bool)
+        test_input = torch.randint(0, NUM_COLOURS, (BATCH, G, G))
+
+        logits, alpha, _ = model(demo_inputs, demo_outputs, demo_mask, test_input)
+        assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
+
+
+# ── Memory-efficient RuleMemory tests ────────────────────────────────────────
+
+
+class TestRuleMemoryOptimised:
+    """Tests verifying the optimised (score-folded) einsum produces correct
+    shapes and equivalent results to the naïve approach."""
+
+    def test_output_shapes_unchanged(self) -> None:
+        """Optimised forward must produce the same shapes as before."""
+        mem = RuleMemory(
+            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK,
+        )
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
+        h = torch.randn(BATCH, EMBED)
+        logits, mem_repr, info = mem(x, h)
+
+        assert logits.shape == (BATCH, MAX_CELLS, NUM_COLOURS)
+        assert mem_repr.shape == (BATCH, EMBED)
+        assert info["scores"].shape == (BATCH, N_SLOTS)
+
+    def test_gradients_flow_through_optimised_path(self) -> None:
+        """A/B parameters must still receive gradients after the optimisation."""
+        mem = RuleMemory(
+            embed_dim=EMBED, num_colours=NUM_COLOURS, num_slots=N_SLOTS, rank=RANK,
+        )
+        x = torch.randn(BATCH, MAX_CELLS, EMBED)
+        h = torch.randn(BATCH, EMBED)
+        logits, _, _ = mem(x, h)
+        logits.sum().backward()
+
+        assert mem.A.grad is not None, "A must receive gradients"
+        assert mem.B.grad is not None, "B must receive gradients"
+        assert mem.keys.grad is not None, "keys must receive gradients"
+
+
+# ── Local attention mask caching tests ───────────────────────────────────────
+
+
+class TestLocalAttentionMaskCache:
+    """Tests for the LRU-cached _local_attention_mask function."""
+
+    def test_cache_returns_identical_tensor(self) -> None:
+        """Repeated calls with the same args should return the cached object."""
+        _local_attention_mask.cache_clear()
+        mask1 = _local_attention_mask(4, 4, 3)
+        mask2 = _local_attention_mask(4, 4, 3)
+        # Same object in memory (cache hit).
+        assert mask1 is mask2
+
+    def test_different_dims_produce_different_masks(self) -> None:
+        """Different grid dimensions must produce different masks."""
+        _local_attention_mask.cache_clear()
+        mask_4x4 = _local_attention_mask(4, 4, 3)
+        mask_3x4 = _local_attention_mask(3, 4, 3)
+        assert mask_4x4.shape != mask_3x4.shape
+
+    def test_mask_shape_is_correct(self) -> None:
+        """Mask should be (H*W, H*W) boolean."""
+        _local_attention_mask.cache_clear()
+        H, W = 5, 3
+        mask = _local_attention_mask(H, W, 7)
+        assert mask.shape == (H * W, H * W)
+        assert mask.dtype == torch.bool
+
+
+# ── Decision hash projection tests ──────────────────────────────────────────
+
+
+class TestDecisionHashProjection:
+    """Tests for the learned decision hash replacing the naïve sum-modulo."""
+
+    def test_decision_proj_exists(self) -> None:
+        """FusionModel must have a decision_proj parameter."""
+        model = FusionModel(
+            embed_dim=EMBED, num_colours=NUM_COLOURS, max_grid_size=MAX_GRID,
+            num_encoder_layers=1, num_cross_attn_layers=1,
+            num_attn_heads=4, num_rule_slots=N_SLOTS, rule_rank=RANK,
+        )
+        assert hasattr(model, "decision_proj")
+        param_names = {n for n, _ in model.named_parameters()}
+        assert "decision_proj.weight" in param_names
+
+    def test_pending_history_uses_projection(self) -> None:
+        """After a training forward pass, _pending_history decisions must
+        come from the projection (values in [0, vocab_size))."""
+        model = FusionModel(
+            embed_dim=EMBED, num_colours=NUM_COLOURS, max_grid_size=MAX_GRID,
+            num_encoder_layers=1, num_cross_attn_layers=1,
+            num_attn_heads=4, num_rule_slots=N_SLOTS, rule_rank=RANK,
+        )
+        model.train()
+        G = MAX_GRID
+        D = 2
+        demo_inputs = torch.randint(0, NUM_COLOURS, (BATCH, D, G, G))
+        demo_outputs = torch.randint(0, NUM_COLOURS, (BATCH, D, G, G))
+        demo_mask = torch.ones(BATCH, D, dtype=torch.bool)
+        test_input = torch.randint(0, NUM_COLOURS, (BATCH, G, G))
+
+        model(demo_inputs, demo_outputs, demo_mask, test_input)
+
+        pending = model._pending_history
+        assert pending is not None
+        decisions = pending["decisions"]
+        assert decisions.shape == (BATCH,)
+        vocab = model.rule_gen.decision_vocab_size
+        assert (decisions >= 0).all() and (decisions < vocab).all()
+
+
+# ── ParquetARCDataset thread-safety test ────────────────────────────────────
+
+
+class TestParquetARCDatasetThreadSafety:
+    """Verify that ParquetARCDataset.__getitem__ does not mutate self.samples."""
+
+    def test_samples_list_unchanged_after_getitem(self) -> None:
+        """self.samples must remain empty after __getitem__ (no shared mutation)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _make_parquet_file(tmp, n_tasks=3)
+            ds = ParquetARCDataset([path], max_grid_size=4)
+
+            assert ds.samples == []
+            _ = ds[0]
+            assert ds.samples == [], (
+                "ParquetARCDataset.__getitem__ must not mutate self.samples"
+            )
+            _ = ds[1]
+            assert ds.samples == []

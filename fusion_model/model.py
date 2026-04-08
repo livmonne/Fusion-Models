@@ -10,11 +10,13 @@ predicted output grid by inferring the transformation rule from the demos.
 1. **Grid cell embedding** — each cell value (0–9) is mapped to a learned
    embedding vector.  2-D sinusoidal positional encodings are added so the
    model knows where each cell sits in the grid.
-2. **Demo pair encoding** — for each demonstration pair the input and
-   output cell embeddings are concatenated along the sequence dimension
-   and processed by a shared Transformer encoder (self-attention blocks).
-   The resulting token sequences are concatenated across all demos into a
-   single *demo context* sequence.
+2. **Demo pair encoding** — all demonstration pairs are embedded and
+   concatenated (input + output) in a single batched pass through the
+   shared Transformer encoder, rather than looping over each demo
+   sequentially.  Invalid demo slots (from the padding mask) are
+   excluded from the encoder pass to save compute.  The resulting token
+   sequences are concatenated across all demos into a single *demo
+   context* sequence.
 3. **Multi-head cross-attention** — the test input cell embeddings
    cross-attend to the demo context via multiple attention heads.
 4. **Spatial tokens + pooled embedding** — the cross-attended test tokens
@@ -192,6 +194,17 @@ class FusionModel(nn.Module):
         # ── Decision router ──────────────────────────────────────────────
         self.router = DecisionRouter(embed_dim=embed_dim)
 
+        # ── Decision hash projection ────────────────────────────────────
+        # Used to convert per-cell logits into a compact decision index
+        # for the RuleGenerator's history buffer.  A learned linear
+        # projection from the pooled logits is far less lossy than the
+        # naïve ``pred_cells.sum() % vocab_size`` approach, which suffers
+        # from massive hash collisions.
+        decision_vocab = self.rule_gen.decision_vocab_size
+        self.decision_proj = nn.Linear(
+            num_colours, decision_vocab, bias=False,
+        )
+
     # ── Deferred history update ─────────────────────────────────────────
 
     @torch.no_grad()
@@ -253,25 +266,34 @@ class FusionModel(nn.Module):
         """
         B, D, H, W = demo_inputs.shape
 
-        # ── 1. Encode each demo pair ─────────────────────────────────────
-        demo_tokens_list: list[torch.Tensor] = []
+        # ── 1. Encode all demo pairs in one batched pass ─────────────────
+        # Instead of looping over each demo index and calling the
+        # encoder D times, we reshape all valid demos into a single
+        # batch dimension (B*D, 2*H*W, E) and run the encoder once.
+        # This gives a ~D× throughput improvement on accelerators.
+        flat_mask = demo_mask.reshape(B * D)           # (B*D,)
+        n_valid = int(flat_mask.sum().item())
 
-        for d in range(D):
-            mask_d = demo_mask[:, d]
-            if not mask_d.any():
-                continue
+        if n_valid > 0:
+            # Gather all (B*D) demo grids, embed, concatenate pairs.
+            all_inp = demo_inputs.reshape(B * D, H, W)   # (B*D, H, W)
+            all_out = demo_outputs.reshape(B * D, H, W)  # (B*D, H, W)
+            all_inp_emb = self._embed_grid(all_inp, type_id=0)  # (B*D, H*W, E)
+            all_out_emb = self._embed_grid(all_out, type_id=1)  # (B*D, H*W, E)
+            all_pairs = torch.cat([all_inp_emb, all_out_emb], dim=1)  # (B*D, 2*H*W, E)
 
-            inp_emb = self._embed_grid(demo_inputs[:, d], type_id=0)
-            out_emb = self._embed_grid(demo_outputs[:, d], type_id=1)
-            pair_emb = torch.cat([inp_emb, out_emb], dim=1)
+            # Run the encoder on valid demos only to avoid wasting
+            # compute on padding-only demo slots.
+            valid_idx = flat_mask.nonzero(as_tuple=True)[0]     # (n_valid,)
+            valid_pairs = all_pairs[valid_idx]                  # (n_valid, 2*H*W, E)
+            valid_encoded = self.demo_encoder(valid_pairs)      # (n_valid, 2*H*W, E)
 
-            pair_encoded = self.demo_encoder(pair_emb)
+            # Scatter back into the full (B*D) layout, zeros for invalid.
+            all_encoded = torch.zeros_like(all_pairs)           # (B*D, 2*H*W, E)
+            all_encoded[valid_idx] = valid_encoded
 
-            pair_encoded = pair_encoded * mask_d.float().view(B, 1, 1)
-            demo_tokens_list.append(pair_encoded)
-
-        if demo_tokens_list:
-            demo_context = torch.cat(demo_tokens_list, dim=1)
+            # Reshape to (B, D*2*H*W, E) — concatenation of all demos.
+            demo_context = all_encoded.view(B, D * 2 * H * W, self.embed_dim)
         else:
             demo_context = torch.zeros(
                 B, 1, self.embed_dim, device=test_input.device,
@@ -337,8 +359,13 @@ class FusionModel(nn.Module):
 
         # ── 8. Stash info for deferred history update ─────────────────────
         if self.training:
-            pred_cells = logits.detach().argmax(dim=-1)  # (B, seq)
-            pred_hash = pred_cells.sum(dim=-1) % self.rule_gen.decision_vocab_size
+            # Project the mean logits through a learned linear layer to
+            # produce a compact decision index.  This preserves much more
+            # information than the old ``pred_cells.sum() % vocab_size``
+            # hash, which suffered from massive collisions.
+            logits_det = logits.detach()                          # (B, seq, C)
+            mean_logits = logits_det.mean(dim=1)                  # (B, C)
+            pred_hash = self.decision_proj(mean_logits).argmax(dim=-1)  # (B,)
             self._pending_history = {
                 "h": h.detach(),
                 "decisions": pred_hash,

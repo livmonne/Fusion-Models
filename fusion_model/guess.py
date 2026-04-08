@@ -26,10 +26,13 @@ a mechanical cell-by-cell procedure.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import torch.nn as nn
 
 
+@functools.lru_cache(maxsize=32)
 def _local_attention_mask(
     grid_h: int, grid_w: int, window_size: int,
 ) -> torch.Tensor:
@@ -37,6 +40,10 @@ def _local_attention_mask(
 
     Tokens may attend to neighbours within Chebyshev distance
     ``window_size // 2`` on the original grid.
+
+    Results are cached with an LRU cache (keyed on ``(grid_h, grid_w,
+    window_size)``) so repeated calls with the same grid dimensions
+    avoid recomputing the ``(seq, seq)`` boolean tensor.
 
     :param grid_h: Height of the grid.
     :param grid_w: Width of the grid.

@@ -112,7 +112,7 @@ Demo Pairs (input/output grids)                Test Input Grid
 | Component | What it does (one sentence) |
 |---|---|
 | **Cell Embedding + Pos Enc** | Converts each grid cell (0–9) into a vector, adds 2-D positional info so the model knows where each cell sits. |
-| **Transformer Encoder** | Reads concatenated demo input+output pairs via self-attention so the model can understand *how* the input was transformed. |
+| **Transformer Encoder** | Reads concatenated demo input+output pairs via self-attention in a single batched pass (all valid demos at once) so the model can understand *how* the input was transformed. |
 | **Multi-Head Cross-Attention** | Lets the test input tokens "ask questions" of the demo context — this is the core mechanism that transfers the inferred rule to the test input. |
 | **RuleMemory** | A persistent bank of 128 reusable low-rank rules, each with a learned trigger.  Rules are matched via **multi-head cross-attention** (4 heads by default) and applied per-cell.  Slot strength decays and reinforces over time (biologically-inspired). |
 | **RuleGenerator** | Invents a one-shot low-rank correction on the fly and maintains a history of past attempts to propose persistent rules for the memory bank. |
@@ -142,13 +142,15 @@ model can process.
 The result is a sequence of token vectors `(batch, H×W, embed_dim)` for
 each grid.
 
-### 2. Demo Pair Encoding (Transformer Encoder)
+### 2. Demo Pair Encoding (Batched Transformer Encoder)
 
-For each demonstration pair, the input and output token sequences are
-concatenated into one long sequence and fed through a shared Transformer
-encoder (4 layers of self-attention by default).  This allows the model to
-learn correspondences between input cells and output cells *within* each
-demo.
+All demonstration pairs are embedded, concatenated (input + output), and
+processed through a shared Transformer encoder **in a single batched
+forward pass** — all valid demos across the batch are stacked into one
+tensor of shape `(n_valid, 2*H*W, embed_dim)`.  Invalid demo slots
+(from the padding mask) are excluded from the encoder pass entirely to
+avoid wasting compute.  This gives a ~D× throughput improvement over the
+naïve approach of looping over each demo index sequentially.
 
 All encoded demo sequences are then concatenated across demos into a
 single **demo context** tensor.
@@ -181,6 +183,10 @@ Each of the 128 memory slots stores:
 - Two small matrices **A** and **B** — their product `A @ (B @ x)` is a
   low-rank correction applied to each token.  This is the same idea as
   LoRA: instead of a full weight matrix, we store two thin factors.
+  During the forward pass, retrieval scores are folded into A/B *before*
+  expanding over the spatial dimension, so peak memory is `O(B × seq × E)`
+  instead of the naïve `O(B × seq × S × E)` (a ~128× reduction for
+  default settings).
 - A **classification head** — converts the corrected embedding into
   per-cell colour logits.
 
@@ -245,9 +251,11 @@ applied per-token just like in RuleMemory, but it exists only for this
 forward pass.
 
 The generator also maintains a **circular history buffer** of recent
-`(embedding, decision, outcome)` triples.  A three-stage cross-attention
-pipeline — operating entirely on history, *not* the current input —
-proposes persistent rules:
+`(embedding, decision, outcome)` triples.  Decision identifiers are
+computed by a **learned linear projection** from the mean per-cell logits
+to a compact vocabulary index, which is far less lossy than a simple
+hash.  A three-stage cross-attention pipeline — operating entirely on
+history, *not* the current input — proposes persistent rules:
 
 1. Historical embeddings attend over historical decisions.
 2. That result attends over outcome signals (per-sample loss).
@@ -270,7 +278,9 @@ two key design choices:
    (Chebyshev distance, default radius 3 cells).  This forces fine-grained
    local pattern detection.  Odd-numbered layers use standard unrestricted
    global attention for long-range integration.  The alternation gives the
-   model both close-up and birds-eye views.
+   model both close-up and birds-eye views.  The local attention masks are
+   LRU-cached by `(grid_h, grid_w)` to avoid recomputing them every
+   forward pass.
 
 2. **FiLM conditioning** — after each layer, the pooled task embedding `h`
    is used to compute per-token scale (`gamma`) and shift (`beta`)
@@ -446,6 +456,11 @@ The training script includes:
   to `N`.  With `--batch_size 4 --grad_accum 32`, the model processes 4
   samples at a time but accumulates gradients over 8 steps before updating.
   `N` must be >= `batch_size` and divisible by it.
+- **Epoch-average routing weights**: The logged routing weights (`alpha`)
+  are averaged over the entire epoch, not just the last batch.
+- **TPU/XLA auto-detection**: The training script automatically detects
+  `torch_xla` and uses XLA devices (TPU) when available.  Falls back to
+  CUDA → Apple MPS → CPU in that order.
 
 ## Project Structure
 

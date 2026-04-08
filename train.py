@@ -174,6 +174,10 @@ def train_fusion(
         epoch_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
+        # Accumulate routing weights across the whole epoch so the logged
+        # alpha is a proper average, not just the last batch's snapshot.
+        alpha_sum = torch.zeros(3, device=device)
+        alpha_count = 0
 
         optimizer.zero_grad()
 
@@ -227,10 +231,15 @@ def train_fusion(
                 optimizer.zero_grad()
 
             # Track unscaled metrics for logging.
-            epoch_loss += loss_dict["task"] * B
+            # Multiply per-cell mean CE by the number of valid cells (not
+            # batch size) so that epoch_loss / epoch_total gives a proper
+            # weighted-average per-cell loss across the whole epoch.
             c, t = compute_cell_accuracy(logits, targets_flat)
+            epoch_loss += loss_dict["task"] * t
             epoch_correct += c
             epoch_total += t
+            alpha_sum += alphas.detach().sum(dim=0)
+            alpha_count += alphas.size(0)
 
         # Flush any remaining accumulated gradients at end of epoch.
         if (step + 1) % accum_steps != 0:
@@ -249,10 +258,12 @@ def train_fusion(
         history["val_acc"].append(val_acc)
 
         current_lr = optimizer.param_groups[0]["lr"]
+        # Use epoch-average routing weights, not just the last batch.
+        alpha_avg = alpha_sum / max(alpha_count, 1)
         alpha_mean = (
-            f"mem={alphas[:, 0].mean():.3f}  "
-            f"rule={alphas[:, 1].mean():.3f}  "
-            f"guess={alphas[:, 2].mean():.3f}"
+            f"mem={alpha_avg[0]:.3f}  "
+            f"rule={alpha_avg[1]:.3f}  "
+            f"guess={alpha_avg[2]:.3f}"
         )
         aux_losses = (
             f"mem={loss_dict['aux_mem']:.4f}  "
@@ -368,13 +379,18 @@ def main() -> None:
     torch.manual_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
-    )
+    # Detect available accelerator: TPU (XLA) → CUDA → Apple MPS → CPU.
+    try:
+        import torch_xla.core.xla_model as xm  # type: ignore[import-untyped]
+        device = xm.xla_device()
+    except ImportError:
+        device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps"
+            if torch.backends.mps.is_available()
+            else "cpu"
+        )
     print(f"Device: {device}")
     print("Loading datasets...")
 

@@ -14,7 +14,10 @@ Each *rule slot* stores three things:
 2. **A, B** — a pair of small matrices whose product ``A @ (B @ x)`` forms a
    low-rank correction to the per-token embeddings.  This is the same idea
    as LoRA (Hu et al., 2021): rather than storing a full weight matrix we
-   only store two thin factors, keeping memory usage small.
+   only store two thin factors, keeping memory usage small.  During the
+   forward pass, retrieval scores are folded into the A/B matrices *before*
+   expanding over the spatial dimension, so peak memory is ``O(B × seq × E)``
+   instead of the naïve ``O(B × seq × S × E)``.
 3. **head** — a tiny linear projection that converts the correction into
    per-cell colour logits.
 
@@ -381,22 +384,33 @@ class RuleMemory(nn.Module):
         gated_scores = raw_scores * strength.unsqueeze(0)
         scores = gated_scores / (gated_scores.sum(dim=-1, keepdim=True) + 1e-8)  # (B, S)
 
-        # -- 3. Per-token low-rank corrections --
-        # compressed(b, t, s, r) = B(s, r, e) · x(b, t, e)
-        compressed = torch.einsum("sre, bte -> btsr", self.B, x)
-        # correction(b, t, s, e) = A(s, e, r) · compressed(b, t, s, r)
-        correction = torch.einsum("ser, btsr -> btse", self.A, compressed)
+        # -- 3–5. Per-token low-rank corrections, blending, and classification --
+        #
+        # The naïve approach materialises a (B, seq, S, E) correction
+        # tensor — with S=128, seq=900, E=256 this is ~471 MB per
+        # micro-batch in float32.  Instead we contract scores into the
+        # computation *before* expanding over the spatial dimension,
+        # producing intermediates of at most (B, seq, E) or (S, R, E).
+        #
+        # Key identity: blended(b,t,e) = Σ_s scores(b,s) · A(s,e,r) · B(s,r,e') · x(b,t,e')
+        #   = Σ_s A(s,e,r) · [ scores(b,s) · B(s,r,e') · x(b,t,e') ]
+        #
+        # Step 1: score-weighted B per sample → wB(b, r, e) = Σ_s scores(b,s) · B(s,r,e)
+        wB = torch.einsum("bs, sre -> bre", scores, self.B)  # (B, R, E)
+        # Step 2: compressed(b, r, t) = wB(b, r, e) · x(b, t, e)^T
+        compressed = torch.bmm(wB, x.transpose(1, 2))  # (B, R, T)
+        # Step 3: score-weighted A → wA(b, e, r) = Σ_s scores(b,s) · A(s,e,r)
+        wA = torch.einsum("bs, ser -> ber", scores, self.A)  # (B, E, R)
+        # Step 4: blended(b, t, e) = (wA @ compressed)^T
+        blended = torch.bmm(wA, compressed).transpose(1, 2)  # (B, T, E)
 
-        # -- 4. Blend corrections using scores --
-        # blended(b, t, e) = Σ_s scores(b, s) · correction(b, t, s, e)
-        blended = torch.einsum("bs, btse -> bte", scores, correction)
-
-        # -- 5. Per-token classification via per-slot heads --
+        # Classification: similarly fold scores into the per-slot heads
+        # before the spatial expansion.
+        # w_heads: (S, C, E)  →  wH(b, c, e) = Σ_s scores(b,s) · W(s,c,e)
         w_heads = self.heads.weight.view(self.num_slots, self.num_colours, self.embed_dim)
-        # slot_logits(b, t, s, c) = correction(b, t, s, e) · W(s, c, e)
-        slot_logits = torch.einsum("btse, sce -> btsc", correction, w_heads)
-        # logits(b, t, c) = Σ_s scores(b, s) · slot_logits(b, t, s, c)
-        logits_mem = torch.einsum("bs, btsc -> btc", scores, slot_logits)
+        wH = torch.einsum("bs, sce -> bce", scores, w_heads)  # (B, C, E)
+        # logits_mem(b, t, c) = blended(b, t, e) · wH(b, c, e)
+        logits_mem = torch.einsum("bte, bce -> btc", blended, wH)  # (B, T, C)
 
         # -- 6. Router representation --
         # Combine two complementary signals for the decision router:
