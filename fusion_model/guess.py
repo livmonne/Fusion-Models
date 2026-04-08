@@ -30,13 +30,17 @@ import torch
 import torch.nn as nn
 
 
+_local_mask_cache: dict[tuple[int, int, int], torch.Tensor] = {}
+
+
 def _local_attention_mask(
     grid_h: int, grid_w: int, window_size: int,
 ) -> torch.Tensor:
     """Build a 2-D local attention mask for a flattened (possibly rectangular) grid.
 
     Tokens may attend to neighbours within Chebyshev distance
-    ``window_size // 2`` on the original grid.
+    ``window_size // 2`` on the original grid.  Results are cached by
+    ``(grid_h, grid_w, window_size)`` to avoid recomputation.
 
     :param grid_h: Height of the grid.
     :param grid_w: Width of the grid.
@@ -44,6 +48,10 @@ def _local_attention_mask(
     :return: Boolean mask ``(seq, seq)`` where *True* means the position
         is **blocked** from attending (PyTorch ``attn_mask`` convention).
     """
+    key = (grid_h, grid_w, window_size)
+    if key in _local_mask_cache:
+        return _local_mask_cache[key]
+
     seq = grid_h * grid_w
     idx = torch.arange(seq)
     rows = idx // grid_w
@@ -53,7 +61,9 @@ def _local_attention_mask(
         (cols[:, None] - cols[None, :]).abs(),
     )
     radius = window_size // 2
-    return dist > radius  # True = blocked
+    mask = dist > radius  # True = blocked
+    _local_mask_cache[key] = mask
+    return mask
 
 
 class _FiLMConditioner(nn.Module):
@@ -171,6 +181,7 @@ class GuessComponent(nn.Module):
         h: torch.Tensor,
         grid_h: int,
         grid_w: int,
+        pad_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute per-token guess-pathway logits.
 
@@ -178,14 +189,44 @@ class GuessComponent(nn.Module):
         :param h: Pooled task embedding ``(batch, embed_dim)`` for FiLM.
         :param grid_h: Height of the (padded) grid.
         :param grid_w: Width of the (padded) grid.
+        :param pad_mask: Boolean mask ``(batch, seq)`` where *True* means
+            the position is a valid (non-pad) cell.  Padded positions are
+            blocked from attending or being attended to.
         :return: Tuple of ``(logits, pooled)`` where *logits* has shape
             ``(batch, seq, num_colours)`` and *pooled* is ``(batch, embed_dim)``
             for the router.
         """
         local_mask = _local_attention_mask(grid_h, grid_w, self.window_size).to(x.device)
 
+        # Combine local window mask with padding mask so padded positions
+        # are fully blocked.  nn.MultiheadAttention expects attn_mask as
+        # float with -inf for blocked positions, shaped (B*H, seq, seq).
+        num_heads = self.layers[0].self_attn.num_heads
+        if pad_mask is not None:
+            # pad_block: (B, 1, seq) float mask, 0.0 for valid, -inf for pad.
+            pad_block = torch.zeros_like(pad_mask, dtype=x.dtype).unsqueeze(1)
+            pad_block[~pad_mask.unsqueeze(1).expand_as(pad_block)] = float("-inf")
+            # Expand (B, 1, seq) → (B, seq, seq) via broadcast in OR below.
+            pad_block_3d = pad_block.expand(-1, pad_mask.size(1), -1)  # (B, seq, seq)
+
         for i, layer in enumerate(self.layers):
-            mask = local_mask if i % 2 == 0 else None
+            if i % 2 == 0:
+                # Convert bool local_mask to float: True (blocked) → -inf.
+                float_local = torch.zeros_like(local_mask, dtype=x.dtype)
+                float_local[local_mask] = float("-inf")
+                if pad_mask is not None:
+                    # Combine: element-wise min keeps the more-blocked value.
+                    combined = float_local.unsqueeze(0) + pad_block_3d  # broadcast (B, seq, seq)
+                    combined = combined.clamp(min=float("-inf"))
+                    # Expand to (B*H, seq, seq) for MHA.
+                    mask = combined.unsqueeze(1).expand(-1, num_heads, -1, -1).reshape(-1, combined.size(1), combined.size(2))
+                else:
+                    mask = float_local
+            else:
+                if pad_mask is not None:
+                    mask = pad_block_3d.unsqueeze(1).expand(-1, num_heads, -1, -1).reshape(-1, pad_block_3d.size(1), pad_block_3d.size(2))
+                else:
+                    mask = None
             x = layer(x, h, mask=mask)
 
         logits_guess: torch.Tensor = self.head(x)  # (B, seq, num_colours)

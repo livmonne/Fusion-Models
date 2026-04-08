@@ -425,6 +425,7 @@ def main() -> None:
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
         collate_fn=arc_collate_fn,
     )
     val_loader = DataLoader(
@@ -433,6 +434,7 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
         collate_fn=arc_collate_fn,
     )
     print(f"Train samples: {len(train_ds):,}  |  Val samples: {len(val_ds):,}")
