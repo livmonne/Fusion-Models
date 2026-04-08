@@ -253,6 +253,7 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=arc_collate_fn,
+        pin_memory=True,
     )
 
     # ── Load trained model ───────────────────────────────────────────────
