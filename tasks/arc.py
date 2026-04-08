@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -55,9 +56,8 @@ def pad_grid(grid: list[list[int]], max_h: int, max_w: int) -> torch.Tensor:
     h = len(grid)
     w = len(grid[0]) if h > 0 else 0
     padded = torch.full((max_h, max_w), PAD_VALUE, dtype=torch.long)
-    for r in range(h):
-        for c in range(len(grid[r])):
-            padded[r, c] = grid[r][c]
+    if h > 0 and w > 0:
+        padded[:h, :w] = torch.tensor(grid, dtype=torch.long)
     return padded
 
 
@@ -376,13 +376,19 @@ class ParquetARCDataset(_BaseARCDataset):
     def __len__(self) -> int:
         return len(self._index)
 
+    @lru_cache(maxsize=4096)
+    def _parse_task(self, t_idx: int, row_idx: int) -> dict[str, Any]:
+        """Parse and cache a task's JSON. Avoids re-parsing the same task."""
+        table = self._tables[t_idx]
+        task_json: str = table.column("task")[row_idx].as_py()
+        return json.loads(task_json)
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         """Parse one task on-the-fly and return padded tensors."""
         t_idx, row_idx, tp_idx = self._index[idx]
         table = self._tables[t_idx]
 
-        task_json: str = table.column("task")[row_idx].as_py()
-        task: dict[str, Any] = json.loads(task_json)
+        task: dict[str, Any] = self._parse_task(t_idx, row_idx)
 
         sample: dict[str, Any] = {
             "task_id": table.column("id")[row_idx].as_py(),

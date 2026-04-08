@@ -279,7 +279,7 @@ class RuleMemory(nn.Module):
         self.keys = nn.Parameter(torch.randn(num_slots, embed_dim) * 0.02)
 
         # Low-rank factors: correction = A @ (B @ x_token).
-        self.B = nn.Parameter(torch.zeros(num_slots, rank, embed_dim))
+        self.B = nn.Parameter(torch.randn(num_slots, rank, embed_dim) * 0.02)
         self.A = nn.Parameter(torch.randn(num_slots, embed_dim, rank) * 0.02)
 
         # Per-slot classification head: maps embed_dim → num_colours.
@@ -317,6 +317,11 @@ class RuleMemory(nn.Module):
 
     # ── Strength computation ────────────────────────────────────────────
 
+    def _recency_score(self) -> torch.Tensor:
+        """Compute the recency component of memory strength (cached per step)."""
+        half_life = self.recency_halflife_log.exp().clamp(min=1.0)
+        return torch.exp(-math.log(2.0) * self.steps_since_activation / half_life)
+
     def get_strength(
         self, freq_override: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -332,10 +337,12 @@ class RuleMemory(nn.Module):
             freq_override if freq_override is not None else self.frequency
         ).clamp(0.0, 1.0)
 
-        half_life = self.recency_halflife_log.exp().clamp(min=1.0)
-        recency_score = torch.exp(-math.log(2.0) * self.steps_since_activation / half_life)
+        # Use cached recency if available (set during forward()).
+        recency = getattr(self, "_cached_recency", None)
+        if recency is None:
+            recency = self._recency_score()
 
-        return freq_score * recency_score
+        return freq_score * recency
 
     # ── Forward pass ──────────────────────────────────────────────────────
 
@@ -363,6 +370,10 @@ class RuleMemory(nn.Module):
         #   head_attn   (B, H, S) — per-head attention maps
         raw_scores, mem_context, head_attn = self.retrieval_attn(h, self.keys)
 
+        # Cache recency score for this forward pass (used by get_strength
+        # and get_weakest_slot without redundant recomputation).
+        self._cached_recency = self._recency_score()
+
         # -- 2. Compute differentiable frequency & gate by memory strength --
         # During training, compute new_freq through the learnable decay/reinforce
         # rate parameters so that gradients flow back to them.
@@ -381,22 +392,23 @@ class RuleMemory(nn.Module):
         gated_scores = raw_scores * strength.unsqueeze(0)
         scores = gated_scores / (gated_scores.sum(dim=-1, keepdim=True) + 1e-8)  # (B, S)
 
-        # -- 3. Per-token low-rank corrections --
-        # compressed(b, t, s, r) = B(s, r, e) · x(b, t, e)
-        compressed = torch.einsum("sre, bte -> btsr", self.B, x)
-        # correction(b, t, s, e) = A(s, e, r) · compressed(b, t, s, r)
-        correction = torch.einsum("ser, btsr -> btse", self.A, compressed)
-
-        # -- 4. Blend corrections using scores --
-        # blended(b, t, e) = Σ_s scores(b, s) · correction(b, t, s, e)
-        blended = torch.einsum("bs, btse -> bte", scores, correction)
-
-        # -- 5. Per-token classification via per-slot heads --
+        # -- 3–5. Fused per-token low-rank corrections + classification --
+        # Instead of materialising the full (B, seq, S, E) correction tensor
+        # (~470 MB), we accumulate the score-weighted results slot-by-slot.
         w_heads = self.heads.weight.view(self.num_slots, self.num_colours, self.embed_dim)
-        # slot_logits(b, t, s, c) = correction(b, t, s, e) · W(s, c, e)
-        slot_logits = torch.einsum("btse, sce -> btsc", correction, w_heads)
-        # logits(b, t, c) = Σ_s scores(b, s) · slot_logits(b, t, s, c)
-        logits_mem = torch.einsum("bs, btsc -> btc", scores, slot_logits)
+        B_dim, T, E = x.shape
+        blended = x.new_zeros(B_dim, T, E)
+        logits_mem = x.new_zeros(B_dim, T, self.num_colours)
+
+        for s in range(self.num_slots):
+            # correction_s: (B, T, E) via low-rank A[s] @ (B[s] @ x)
+            comp_s = torch.einsum("re, bte -> btr", self.B[s], x)       # (B, T, r)
+            corr_s = torch.einsum("er, btr -> bte", self.A[s], comp_s)  # (B, T, E)
+            w_s = scores[:, s].unsqueeze(-1).unsqueeze(-1)               # (B, 1, 1)
+            blended = blended + w_s * corr_s
+            # Per-slot logits: corr_s @ W[s].T → (B, T, num_colours)
+            logits_s = torch.einsum("bte, ce -> btc", corr_s, w_heads[s])
+            logits_mem = logits_mem + w_s * logits_s
 
         # -- 6. Router representation --
         # Combine two complementary signals for the decision router:
@@ -425,6 +437,9 @@ class RuleMemory(nn.Module):
                     and self.step_counter.item() % self.prune_every_n_steps == 0
                 ):
                     self.prune_weak_slots()
+
+        # Clear recency cache — only valid within a single forward pass.
+        self._cached_recency = None
 
         retrieval_info: dict[str, torch.Tensor] = {
             "scores": scores,
@@ -488,7 +503,7 @@ class RuleMemory(nn.Module):
         if n_pruned > 0:
             self.keys.data[dead] = torch.randn_like(self.keys.data[dead]) * 0.02
             self.A.data[dead] = torch.randn_like(self.A.data[dead]) * 0.02
-            self.B.data[dead] = 0.0
+            self.B.data[dead] = torch.randn_like(self.B.data[dead]) * 0.02
             self.frequency[dead] = 0.5
             self.steps_since_activation[dead] = 0.0
             self.utility[dead] = 0.0

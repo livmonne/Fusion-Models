@@ -303,7 +303,9 @@ class FusionModel(nn.Module):
         # Each expert receives x (B, seq, E) and produces (B, seq, num_colours).
         logits_mem, mem_repr, retrieval_info = self.memory(x, h)
         logits_rule, confidence, rule_repr, proposal = self.rule_gen(x, h)
-        logits_guess, guess_repr = self.guess(x, h, grid_h=H, grid_w=W)
+        logits_guess, guess_repr = self.guess(
+            x, h, grid_h=H, grid_w=W, pad_mask=pad_mask.bool(),
+        )
 
         # ── 6. Route and blend ───────────────────────────────────────────
         alpha, router_attn = self.router(h, mem_repr, rule_repr, guess_repr)
