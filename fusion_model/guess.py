@@ -26,10 +26,19 @@ a mechanical cell-by-cell procedure.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import torch.nn as nn
 
+# Device-aware cache for local attention masks.  The pure function
+# ``_local_attention_mask`` builds the mask on CPU; this dict caches
+# the on-device copy so ``.to(device)`` is only called once per
+# unique (grid_h, grid_w, window_size, device) combination.
+_mask_cache: dict[tuple[int, int, int, torch.device], torch.Tensor] = {}
 
+
+@functools.lru_cache(maxsize=32)
 def _local_attention_mask(
     grid_h: int, grid_w: int, window_size: int,
 ) -> torch.Tensor:
@@ -182,7 +191,12 @@ class GuessComponent(nn.Module):
             ``(batch, seq, num_colours)`` and *pooled* is ``(batch, embed_dim)``
             for the router.
         """
-        local_mask = _local_attention_mask(grid_h, grid_w, self.window_size).to(x.device)
+        cache_key = (grid_h, grid_w, self.window_size, x.device)
+        if cache_key not in _mask_cache:
+            _mask_cache[cache_key] = _local_attention_mask(
+                grid_h, grid_w, self.window_size,
+            ).to(x.device)
+        local_mask = _mask_cache[cache_key]
 
         for i, layer in enumerate(self.layers):
             mask = local_mask if i % 2 == 0 else None
