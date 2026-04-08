@@ -65,7 +65,7 @@ function Precommit {
 function Train {
     <# Launch a quick debug training run with a small data subset. #>
     Write-Host ">> Starting debug training run..." -ForegroundColor Cyan
-    uv run python train.py --max_samples 100 --epochs 2 --batch_size 16
+    uv run python train.py --max_samples 20 --epochs 2 --batch_size 4
 }
 
 function Clean {
