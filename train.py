@@ -227,7 +227,7 @@ def train_fusion(
                 optimizer.zero_grad()
 
             # Track unscaled metrics for logging.
-            epoch_loss += loss_dict["task"] * B
+            epoch_loss += loss_dict["task"].item() * B
             c, t = compute_cell_accuracy(logits, targets_flat)
             epoch_correct += c
             epoch_total += t
@@ -250,14 +250,14 @@ def train_fusion(
 
         current_lr = optimizer.param_groups[0]["lr"]
         alpha_mean = (
-            f"mem={alphas[:, 0].mean():.3f}  "
-            f"rule={alphas[:, 1].mean():.3f}  "
-            f"guess={alphas[:, 2].mean():.3f}"
+            f"mem={alphas[:, 0].mean().item():.3f}  "
+            f"rule={alphas[:, 1].mean().item():.3f}  "
+            f"guess={alphas[:, 2].mean().item():.3f}"
         )
         aux_losses = (
-            f"mem={loss_dict['aux_mem']:.4f}  "
-            f"rule={loss_dict['aux_rule']:.4f}  "
-            f"guess={loss_dict['aux_guess']:.4f}"
+            f"mem={loss_dict['aux_mem'].item():.4f}  "
+            f"rule={loss_dict['aux_rule'].item():.4f}  "
+            f"guess={loss_dict['aux_guess'].item():.4f}"
         )
         print(
             f"Epoch {epoch:3d}/{args.epochs}  "
