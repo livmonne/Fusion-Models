@@ -52,11 +52,20 @@ def pad_grid(grid: list[list[int]], max_h: int, max_w: int) -> torch.Tensor:
     :param max_w: Target width.
     :return: ``int64`` tensor of shape ``(max_h, max_w)``.
     """
-    h = len(grid)
+    h = min(len(grid), max_h)
     padded = torch.full((max_h, max_w), PAD_VALUE, dtype=torch.long)
-    for r in range(min(h, max_h)):
-        for c in range(min(len(grid[r]), max_w)):
-            padded[r, c] = grid[r][c]
+    if h == 0:
+        return padded
+    w = min(len(grid[0]), max_w)
+    if w > 0 and all(len(row) == len(grid[0]) for row in grid[:h]):
+        # Rectangular fast path: one tensor copy instead of Python loops.
+        rows = torch.tensor([row[:w] for row in grid[:h]], dtype=torch.long)
+        padded[:h, :w] = rows
+    else:
+        # Ragged fallback (should not occur in well-formed ARC data).
+        for r in range(h):
+            for c in range(min(len(grid[r]), max_w)):
+                padded[r, c] = grid[r][c]
     return padded
 
 

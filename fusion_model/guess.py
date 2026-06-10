@@ -28,19 +28,25 @@ a mechanical cell-by-cell procedure.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import torch.nn as nn
 
 from .common import masked_mean
 
 
+@functools.lru_cache(maxsize=64)
 def _local_attention_mask(
     grid_h: int, grid_w: int, window_size: int,
 ) -> torch.Tensor:
     """Build a 2-D local attention mask for a flattened (possibly rectangular) grid.
 
     Tokens may attend to neighbours within Chebyshev distance
-    ``window_size // 2`` on the original grid.
+    ``window_size // 2`` on the original grid.  Cached per
+    ``(grid_h, grid_w, window_size)`` — the mask is rebuilt at most once
+    per grid shape instead of on every forward pass.  Callers must treat
+    the returned tensor as read-only.
 
     :param grid_h: Height of the grid.
     :param grid_w: Width of the grid.
