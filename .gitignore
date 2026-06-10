@@ -29,3 +29,5 @@ Thumbs.db
 *.egg-info/
 dist/
 build/
+
+data/
