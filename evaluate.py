@@ -1,13 +1,13 @@
-"""Evaluation and visualisation for the Fusion Model on CLEVR.
+"""Evaluation and visualisation for the Fusion Model on ARC-AGI-2.
 
 Run this after ``train.py`` to generate:
 
-1. **Accuracy table** — overall and per-answer-type.
-2. **Router behaviour bar chart** — mean routing weights broken down by
-   question type (count / compare / exist / query).
-3. **Alpha heatmap** — per-answer average routing weights.
-4. **Training curves** — loss and accuracy over epochs.
-5. **Rule utility histogram** — memory slot utilisation.
+1. **Accuracy summary** — overall per-cell accuracy and per-task solve rate.
+2. **Router behaviour** — mean routing weights across tasks.
+3. **Training curves** — loss and accuracy over epochs.
+4. **Rule utility histogram** — memory slot utilisation.
+5. **Grid visualisation** — side-by-side input / predicted / ground-truth
+   grids for a sample of tasks.
 """
 
 from __future__ import annotations
@@ -15,47 +15,33 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib.colors import ListedColormap
 from torch.utils.data import DataLoader
 
 from fusion_model import FusionModel
-from tasks.clevr import ANSWER_VOCAB, NUM_ANSWERS, CLEVRDataset, build_question_vocab
+from tasks.arc import NUM_COLOURS, PAD_VALUE, ARCDataset, arc_collate_fn
 
-# Use the non-interactive Agg backend so plots can be saved headlessly.
 matplotlib.use("Agg")
 
-# ── Question-type heuristic ─────────────────────────────────────────────────
-# CLEVR questions can be roughly categorised by their first few words.
-
-_TYPE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("count", re.compile(r"^how many\b", re.I)),
-    ("exist", re.compile(r"^(is there|are there)\b", re.I)),
-    (
-        "compare",
-        re.compile(
-            r"^(is the .+ the same|do the .+ have the same|is the .+ (bigger|smaller))", re.I
-        ),
-    ),
-    ("query", re.compile(r"^what (color|material|size|shape|number)\b", re.I)),
+# ARC colour palette (matches the official ARC visualiser).
+ARC_COLOURS = [
+    "#000000",  # 0: black
+    "#0074D9",  # 1: blue
+    "#FF4136",  # 2: red
+    "#2ECC40",  # 3: green
+    "#FFDC00",  # 4: yellow
+    "#AAAAAA",  # 5: grey
+    "#F012BE",  # 6: magenta
+    "#FF851B",  # 7: orange
+    "#7FDBFF",  # 8: cyan
+    "#B10DC9",  # 9: maroon
 ]
-
-
-def classify_question(question: str) -> str:
-    """Return a coarse question type based on simple regex patterns.
-
-    :param question: Raw question string.
-    :return: One of ``"count"``, ``"exist"``, ``"compare"``, ``"query"``,
-        or ``"other"``.
-    """
-    for name, pattern in _TYPE_PATTERNS:
-        if pattern.search(question):
-            return name
-    return "other"
+ARC_CMAP = ListedColormap(ARC_COLOURS)
 
 
 # ── Gather predictions ──────────────────────────────────────────────────────
@@ -65,132 +51,131 @@ def gather_predictions(
     model: FusionModel,
     loader: DataLoader,  # type: ignore[type-arg]
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Run inference and collect predictions, targets, and routing alphas.
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray]:
+    """Run inference and collect per-sample predictions.
 
-    :param model: Trained Fusion Model.
-    :param loader: DataLoader yielding ``(images, questions, answers)`` batches.
-    :param device: Torch device.
-    :return: Tuple of NumPy arrays ``(preds, targets, alphas)`` with shapes
-        ``(N,)``, ``(N,)``, ``(N, 3)``.
+    :return: Tuple of ``(pred_grids, target_grids, input_grids, alphas)``
+        where grids are lists of 2-D arrays and alphas is ``(N, 3)``.
     """
-    all_preds: list[torch.Tensor] = []
-    all_targets: list[torch.Tensor] = []
+    all_preds: list[np.ndarray] = []
+    all_targets: list[np.ndarray] = []
+    all_inputs: list[np.ndarray] = []
     all_alphas: list[torch.Tensor] = []
     model.eval()
 
     with torch.no_grad():
-        for images, questions, answers in loader:
-            images = images.to(device)
-            questions = questions.to(device)
-            logits, alphas, _ = model(images, questions)
-            all_preds.append(logits.argmax(dim=-1).cpu())
-            all_targets.append(answers)
+        for batch in loader:
+            demo_inputs = batch["demo_inputs"].to(device)
+            demo_outputs = batch["demo_outputs"].to(device)
+            demo_mask = batch["demo_mask"].to(device)
+            test_input = batch["test_input"].to(device)
+            test_output = batch["test_output"]
+            output_size = batch["output_size"]
+            input_size = batch["input_size"]
+
+            logits, alphas, _ = model(demo_inputs, demo_outputs, demo_mask, test_input)
+            preds = logits.argmax(dim=-1).cpu()  # (B, max_cells)
             all_alphas.append(alphas.cpu())
 
-    preds_arr: np.ndarray = torch.cat(all_preds).numpy()
-    targets_arr: np.ndarray = torch.cat(all_targets).numpy()
+            B = test_input.size(0)
+            H, W = test_input.size(1), test_input.size(2)
+            for i in range(B):
+                oh, ow = output_size[i].tolist()
+                ih, iw = input_size[i].tolist()
+
+                pred_grid = preds[i].view(H, W)[:oh, :ow].numpy() if oh > 0 and ow > 0 else np.zeros((1, 1), dtype=int)
+                tgt_grid = test_output[i][:oh, :ow].numpy() if oh > 0 and ow > 0 else np.zeros((1, 1), dtype=int)
+                inp_grid = test_input[i].cpu()[:ih, :iw].numpy()
+
+                all_preds.append(pred_grid)
+                all_targets.append(tgt_grid)
+                all_inputs.append(inp_grid)
+
     alphas_arr: np.ndarray = torch.cat(all_alphas).numpy()
-    return preds_arr, targets_arr, alphas_arr
+    return all_preds, all_targets, all_inputs, alphas_arr
 
 
 # ── Visualisations ──────────────────────────────────────────────────────────
 
 
-def print_accuracy_table(preds: np.ndarray, targets: np.ndarray) -> None:
-    """Print overall and per-answer accuracy.
-
-    :param preds: Predicted class indices.
-    :param targets: Ground-truth class indices.
-    """
-    overall = (preds == targets).mean()
-    print(f"\nOverall accuracy: {overall:.4f}")
-    print(f"\n{'Answer':<12} {'Accuracy':>8} {'Count':>8}")
-    print("-" * 32)
-    for idx, name in enumerate(ANSWER_VOCAB):
-        mask = targets == idx
-        if mask.sum() == 0:
-            continue
-        acc = (preds[mask] == targets[mask]).mean()
-        print(f"{name:<12} {acc:>8.3f} {int(mask.sum()):>8}")
-
-
-def plot_router_by_qtype(
-    alphas: np.ndarray,
-    questions_raw: list[str],
-    out_dir: str,
+def print_accuracy_summary(
+    preds: list[np.ndarray], targets: list[np.ndarray]
 ) -> None:
-    """Bar chart of mean routing weights per question type.
+    """Print per-cell accuracy and task solve rate."""
+    total_correct = 0
+    total_cells = 0
+    tasks_solved = 0
 
-    :param alphas: Array of shape ``(N, 3)`` with routing weights.
-    :param questions_raw: List of raw question strings parallel to *alphas*.
-    :param out_dir: Directory in which to save the plot.
-    """
-    # Group alphas by question type.
-    groups: dict[str, list[np.ndarray]] = {}
-    for alpha_row, q in zip(alphas, questions_raw, strict=False):
-        qtype = classify_question(q)
-        groups.setdefault(qtype, []).append(alpha_row)
+    for pred, tgt in zip(preds, targets, strict=True):
+        mask = tgt >= 0
+        correct = (pred[mask] == tgt[mask]).sum()
+        cells = mask.sum()
+        total_correct += correct
+        total_cells += cells
+        if correct == cells and cells > 0:
+            tasks_solved += 1
 
-    type_names = sorted(groups)
-    means = np.array([np.mean(groups[t], axis=0) for t in type_names])
+    cell_acc = total_correct / total_cells if total_cells > 0 else 0.0
+    solve_rate = tasks_solved / len(preds) if preds else 0.0
+    print(f"\nPer-cell accuracy: {cell_acc:.4f}")
+    print(f"Task solve rate:   {solve_rate:.4f} ({tasks_solved}/{len(preds)})")
 
-    x = np.arange(len(type_names))
-    width = 0.25
+
+def plot_grid(
+    ax: plt.Axes, grid: np.ndarray, title: str
+) -> None:
+    """Plot a single ARC grid on a matplotlib axis."""
+    ax.imshow(grid, cmap=ARC_CMAP, vmin=0, vmax=9, interpolation="nearest")
+    ax.set_title(title, fontsize=9)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color("gray")
+
+
+def plot_sample_grids(
+    inputs: list[np.ndarray],
+    preds: list[np.ndarray],
+    targets: list[np.ndarray],
+    out_dir: str,
+    num_samples: int = 8,
+) -> None:
+    """Visualise input / predicted / ground-truth grids side by side."""
+    n = min(num_samples, len(inputs))
+    fig, axes = plt.subplots(n, 3, figsize=(9, 3 * n))
+    if n == 1:
+        axes = axes[np.newaxis, :]
+
+    for i in range(n):
+        plot_grid(axes[i, 0], inputs[i], "Input")
+        plot_grid(axes[i, 1], preds[i], "Predicted")
+        plot_grid(axes[i, 2], targets[i], "Ground Truth")
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "sample_grids.png"), dpi=150)
+    plt.close(fig)
+    print("Saved sample_grids.png")
+
+
+def plot_router_summary(alphas: np.ndarray, out_dir: str) -> None:
+    """Bar chart of mean routing weights."""
+    means = alphas.mean(axis=0)
     labels = [r"$\alpha_{mem}$", r"$\alpha_{rule}$", r"$\alpha_{guess}$"]
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    for i, label in enumerate(labels):
-        ax.bar(x + i * width, means[:, i], width, label=label)
-    ax.set_xticks(x + width)
-    ax.set_xticklabels(type_names)
+    fig, ax = plt.subplots(figsize=(5, 3))
+    ax.bar(labels, means, color=["#0074D9", "#FF4136", "#2ECC40"])
     ax.set_ylabel("Mean routing weight")
-    ax.set_title("Router Behaviour by Question Type")
-    ax.legend()
+    ax.set_title("Router Behaviour (ARC-AGI-2)")
     ax.set_ylim(0, 1)
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "router_by_qtype.png"), dpi=150)
+    fig.savefig(os.path.join(out_dir, "router_summary.png"), dpi=150)
     plt.close(fig)
-    print("Saved router_by_qtype.png")
-
-
-def plot_alpha_heatmap(alphas: np.ndarray, targets: np.ndarray, out_dir: str) -> None:
-    """Heatmap of average routing weights per answer class.
-
-    :param alphas: Array of shape ``(N, 3)``.
-    :param targets: Ground-truth class indices ``(N,)``.
-    :param out_dir: Output directory.
-    """
-    class_alphas = np.zeros((NUM_ANSWERS, 3))
-    for c in range(NUM_ANSWERS):
-        mask = targets == c
-        if mask.sum() > 0:
-            class_alphas[c] = alphas[mask].mean(axis=0)
-
-    fig, ax = plt.subplots(figsize=(5, 10))
-    im = ax.imshow(class_alphas, aspect="auto", cmap="YlOrRd", vmin=0, vmax=1)
-    ax.set_xticks([0, 1, 2])
-    ax.set_xticklabels([r"$\alpha_{mem}$", r"$\alpha_{rule}$", r"$\alpha_{guess}$"])
-    ax.set_yticks(range(NUM_ANSWERS))
-    ax.set_yticklabels(ANSWER_VOCAB)
-    ax.set_title("Routing Weights per Answer")
-
-    for i in range(NUM_ANSWERS):
-        for j in range(3):
-            ax.text(j, i, f"{class_alphas[i, j]:.2f}", ha="center", va="center", fontsize=7)
-
-    fig.colorbar(im, ax=ax, shrink=0.6)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "alpha_heatmap.png"), dpi=150)
-    plt.close(fig)
-    print("Saved alpha_heatmap.png")
+    print("Saved router_summary.png")
 
 
 def plot_training_curves(out_dir: str) -> None:
-    """Plot loss and accuracy curves from the saved training history.
-
-    :param out_dir: Directory containing ``fusion_history.json``.
-    """
+    """Plot loss and accuracy curves from the saved training history."""
     with open(os.path.join(out_dir, "fusion_history.json"), encoding="utf-8") as fh:
         hist: dict[str, list[float]] = json.load(fh)
 
@@ -204,7 +189,7 @@ def plot_training_curves(out_dir: str) -> None:
     axes[1].plot(hist["train_acc"], label="train")
     axes[1].plot(hist["val_acc"], label="val")
     axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Accuracy")
+    axes[1].set_ylabel("Per-Cell Accuracy")
     axes[1].set_title("Accuracy")
     axes[1].legend()
 
@@ -215,11 +200,7 @@ def plot_training_curves(out_dir: str) -> None:
 
 
 def plot_rule_utility(model: FusionModel, out_dir: str) -> None:
-    """Bar chart showing how much each memory slot is used.
-
-    :param model: Trained Fusion Model (contains the utility buffer).
-    :param out_dir: Output directory.
-    """
+    """Bar chart showing how much each memory slot is used."""
     utility_tensor = model.memory.utility.cpu()
     utility: np.ndarray = utility_tensor.numpy()
 
@@ -239,11 +220,14 @@ def plot_rule_utility(model: FusionModel, out_dir: str) -> None:
 
 def main() -> None:
     """Load the best model, run evaluation, and generate all plots."""
-    parser = argparse.ArgumentParser(description="Evaluate Fusion Model on CLEVR")
-    parser.add_argument("--clevr_root", type=str, default="CLEVR_v1.0")
+    parser = argparse.ArgumentParser(description="Evaluate Fusion Model on ARC-AGI-2")
+    parser.add_argument("--data_root", type=str, default="data")
     parser.add_argument("--out_dir", type=str, default="outputs")
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--max_grid_size", type=int, default=30)
+    parser.add_argument("--max_demos", type=int, default=5)
+    parser.add_argument("--embed_dim", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
 
@@ -255,15 +239,12 @@ def main() -> None:
         else "cpu"
     )
 
-    # ── Build vocab and dataset ──────────────────────────────────────────
-    train_q_path = os.path.join(args.clevr_root, "questions", "CLEVR_train_questions.json")
-    question_vocab: dict[str, int] = build_question_vocab(train_q_path)
-    vocab_size = len(question_vocab)
-
-    val_ds = CLEVRDataset(
-        args.clevr_root,
-        split="val",
-        question_vocab=question_vocab,
+    # ── Build dataset ────────────────────────────────────────────────────
+    eval_dir = os.path.join(args.data_root, "evaluation")
+    val_ds = ARCDataset(
+        eval_dir,
+        max_grid_size=args.max_grid_size,
+        max_demos=args.max_demos,
         max_samples=args.max_samples,
     )
     val_loader = DataLoader(
@@ -271,29 +252,36 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        collate_fn=arc_collate_fn,
     )
 
     # ── Load trained model ───────────────────────────────────────────────
-    model = FusionModel(vocab_size=vocab_size, num_classes=NUM_ANSWERS).to(device)
+    model = FusionModel(
+        embed_dim=args.embed_dim,
+        num_colours=NUM_COLOURS,
+        max_grid_size=args.max_grid_size,
+    ).to(device)
     ckpt_path = os.path.join(args.out_dir, "fusion_best.pt")
-    model.load_state_dict(torch.load(ckpt_path, weights_only=True, map_location=device))
+    state = torch.load(ckpt_path, weights_only=True, map_location=device)
+    # Compatibility: old checkpoints have pos_encoding as (G*G, E) instead of (G, G, E).
+    pe = state.get("pos_encoding")
+    if pe is not None and pe.dim() == 2:
+        G = int(pe.size(0) ** 0.5)
+        state["pos_encoding"] = pe.view(G, G, -1)
+    model.load_state_dict(state)
     print(f"Loaded weights from {ckpt_path}")
 
     # ── Predictions ──────────────────────────────────────────────────────
-    preds, targets, alphas = gather_predictions(model, val_loader, device)
+    preds, targets, inputs, alphas = gather_predictions(model, val_loader, device)
 
-    # ── 1. Accuracy table ────────────────────────────────────────────────
-    print_accuracy_table(preds, targets)
+    # ── 1. Accuracy summary ──────────────────────────────────────────────
+    print_accuracy_summary(preds, targets)
 
-    # ── 2. Router by question type ───────────────────────────────────────
-    # We need the raw question strings to classify by type.
-    questions_raw: list[str] = [e["question"] for e in val_ds.entries]
-    if args.max_samples is not None:
-        questions_raw = questions_raw[: args.max_samples]
-    plot_router_by_qtype(alphas, questions_raw, args.out_dir)
+    # ── 2. Router summary ────────────────────────────────────────────────
+    plot_router_summary(alphas, args.out_dir)
 
-    # ── 3. Alpha heatmap ─────────────────────────────────────────────────
-    plot_alpha_heatmap(alphas, targets, args.out_dir)
+    # ── 3. Sample grid visualisations ────────────────────────────────────
+    plot_sample_grids(inputs, preds, targets, args.out_dir)
 
     # ── 4. Training curves ───────────────────────────────────────────────
     plot_training_curves(args.out_dir)

@@ -1,47 +1,47 @@
 """FusionModel — orchestrator that wires all components together.
 
-The Fusion Model is a multimodal architecture for Visual Question Answering.
-It accepts an **image** and a **question** and produces a probability
-distribution over a fixed set of answers.
+The Fusion Model is an architecture for abstract reasoning on grid
+transformation tasks (ARC-AGI-2).  It accepts a set of **demonstration
+input/output grid pairs** and a **test input grid**, and produces a
+predicted output grid by inferring the transformation rule from the demos.
 
 **Forward pass overview:**
 
-1. **Image encoding** — a pre-trained ResNet-18 extracts a spatial feature
-   map.  Early layers (conv1 through layer2) are frozen; layer3 and layer4
-   are fine-tuned.  The resulting ``(batch, 512, 7, 7)`` map is projected
-   to ``embed_dim`` channels via a 1x1 convolution.
-2. **Question encoding** — word embeddings are fed through a GRU; the last
-   hidden state is projected to ``embed_dim``.
-3. **Multi-head spatial attention** — the question embedding attends over
-   the 7x7 spatial grid via ``num_attn_heads`` parallel attention heads.
-   Each head can focus on a different image region (e.g. subject vs.
-   reference object), and their outputs are concatenated into a single
-   attended image vector of shape ``(batch, embed_dim)``.
-4. **Multimodal fusion** — the attended image vector and question vector
-   are combined (element-wise product + linear projection) into a single
-   shared embedding ``h``.
-5. **Three expert pathways** each process ``h`` independently:
-   - :class:`~fusion_model.memory.RuleMemory` — retrieves stored rules.
-   - :class:`~fusion_model.rule_engine.RuleGenerator` — produces ephemeral
-     corrections *and* proposes persistent rules for the memory bank.
-   - :class:`~fusion_model.guess.GuessComponent` — self-attention predictor.
-6. **Rule commitment** — if the RuleGenerator's proposal confidence exceeds
-   a learnable threshold, the proposed rule is written into the
-   lowest-utility slot of the memory bank.
-7. **DecisionRouter** — produces softmax mixture weights ``alpha`` over the
-   three pathways.
-8. **History update** — the current ``(h, prediction)`` pair is appended to
-   the RuleGenerator's circular history buffer (training only).
-9. **Output** — the final logits are the weighted sum of the pathway logits.
+1. **Grid cell embedding** — each cell value (0–9) is mapped to a learned
+   embedding vector.  2-D sinusoidal positional encodings are added so the
+   model knows where each cell sits in the grid.
+2. **Demo pair encoding** — all demonstration pairs are embedded and
+   concatenated (input + output) in a single batched pass through the
+   shared Transformer encoder, rather than looping over each demo
+   sequentially.  Invalid demo slots (from the padding mask) are
+   excluded from the encoder pass to save compute.  The resulting token
+   sequences are concatenated across all demos into a single *demo
+   context* sequence.
+3. **Multi-head cross-attention** — the test input cell embeddings
+   cross-attend to the demo context via multiple attention heads.
+4. **Spatial tokens + pooled embedding** — the cross-attended test tokens
+   ``x`` of shape ``(batch, seq, embed_dim)`` carry per-cell spatial
+   information.  A mean-pooled vector ``h`` summarises the task globally.
+5. **Three expert pathways** each receive the full spatial sequence ``x``
+   (and pooled ``h`` where needed) and return **per-cell colour logits**
+   ``(batch, seq, num_colours)`` plus a pooled representation for the
+   router:
+   - :class:`~fusion_model.memory.RuleMemory`
+   - :class:`~fusion_model.rule_engine.RuleGenerator`
+   - :class:`~fusion_model.guess.GuessComponent` (FiLM-conditioned local/global attention)
+6. **DecisionRouter** — produces softmax mixture weights ``alpha`` over
+   the three pathways.
+7. **Output** — the blended per-cell logits ``(batch, seq, num_colours)``.
+8. **Rule commitment** and **history update** proceed as before.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
 import torch.nn as nn
-import torchvision.models as models
 
 from .decision import DecisionRouter
 from .guess import GuessComponent
@@ -49,74 +49,126 @@ from .memory import RuleMemory
 from .rule_engine import RuleGenerator
 
 
-class FusionModel(nn.Module):
-    """End-to-end Fusion Model for CLEVR Visual Question Answering.
+def _sinusoidal_pos_encoding_2d(
+    max_h: int, max_w: int, embed_dim: int
+) -> torch.Tensor:
+    """Generate 2-D sinusoidal positional encodings.
 
-    :param vocab_size: Number of unique words in the question vocabulary
-        (including ``<PAD>`` and ``<UNK>``).
+    Returns a tensor of shape ``(max_h * max_w, embed_dim)`` where the
+    first half of channels encode the row position and the second half
+    encode the column position.
+    """
+    half = embed_dim // 2
+    pos_h = torch.arange(max_h, dtype=torch.float).unsqueeze(1)  # (H, 1)
+    pos_w = torch.arange(max_w, dtype=torch.float).unsqueeze(1)  # (W, 1)
+    div = torch.exp(torch.arange(0, half, 2, dtype=torch.float) * -(math.log(10000.0) / half))
+
+    pe_h = torch.zeros(max_h, half)
+    pe_h[:, 0::2] = torch.sin(pos_h * div[: half // 2 + (half % 2)])
+    pe_h[:, 1::2] = torch.cos(pos_h * div[: half // 2])
+
+    pe_w = torch.zeros(max_w, half)
+    pe_w[:, 0::2] = torch.sin(pos_w * div[: half // 2 + (half % 2)])
+    pe_w[:, 1::2] = torch.cos(pos_w * div[: half // 2])
+
+    # Broadcast: (H, 1, half) + (1, W, half) → (H, W, half)
+    pe = torch.cat(
+        [pe_h.unsqueeze(1).expand(-1, max_w, -1),
+         pe_w.unsqueeze(0).expand(max_h, -1, -1)],
+        dim=-1,
+    )  # (H, W, embed_dim)
+    return pe
+
+
+class FusionModel(nn.Module):
+    """End-to-end Fusion Model for ARC-AGI-2 grid transformation tasks.
+
     :param embed_dim: Internal embedding dimensionality shared by all
-        expert pathways.
-    :param num_classes: Number of answer classes (28 for CLEVR).
+        components.
+    :param num_colours: Number of distinct cell values (10 for ARC).
+    :param max_grid_size: Maximum grid dimension (30 for ARC).
+    :param num_encoder_layers: Number of Transformer encoder layers for
+        processing demo pairs.
+    :param num_cross_attn_layers: Number of cross-attention layers for
+        transferring demo context to the test input.
+    :param num_attn_heads: Number of attention heads in all multi-head
+        attention layers.
     :param num_rule_slots: Number of rule slots in the memory bank.
-    :param rule_rank: Low-rank dimension used by both memory and generator.
-    :param q_embed_dim: Word-embedding dimension for question tokens.
-    :param q_hidden_dim: GRU hidden size for the question encoder.
-    :param num_attn_heads: Number of parallel attention heads for the
-        question-guided spatial attention over the image feature map.
+    :param rule_rank: Low-rank dimension used by memory and generator.
     :param history_size: Capacity of the RuleGenerator's circular history
-        buffer for ``(h, prediction)`` pairs.
+        buffer.
     """
 
     def __init__(
         self,
-        vocab_size: int = 100,
         embed_dim: int = 256,
-        num_classes: int = 28,
+        num_colours: int = 10,
+        max_grid_size: int = 30,
+        num_encoder_layers: int = 4,
+        num_cross_attn_layers: int = 4,
+        num_attn_heads: int = 8,
         num_rule_slots: int = 128,
         rule_rank: int = 16,
-        q_embed_dim: int = 128,
-        q_hidden_dim: int = 256,
-        num_attn_heads: int = 4,
         history_size: int = 512,
     ) -> None:
         super().__init__()
+        self.embed_dim = embed_dim
+        self.num_colours = num_colours
+        self.max_grid_size = max_grid_size
+        self.max_output_cells = max_grid_size * max_grid_size  # 900 for 30×30
 
-        # ── Image encoder (partially fine-tuned ResNet-18) ────────────────
-        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-
-        # Frozen early layers: learn generic low-level features (edges,
-        # colours, textures) that transfer well across domains.
-        self.backbone_frozen = nn.Sequential(
-            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
-            resnet.layer1, resnet.layer2,
-        )
-        for param in self.backbone_frozen.parameters():
-            param.requires_grad = False
-
-        # Fine-tuned late layers: adapt high-level features to CLEVR's
-        # synthetic objects, producing a (batch, 512, 7, 7) spatial map.
-        self.backbone_finetune = nn.Sequential(resnet.layer3, resnet.layer4)
-
-        # 1x1 conv projects each spatial position: 512 → embed_dim.
-        self.image_proj = nn.Conv2d(512, embed_dim, kernel_size=1)
-
-        # ── Multi-head spatial attention ─────────────────────────────────
-        # The question embedding queries over the 7x7 spatial grid.  Each
-        # head can attend to a different image region independently, letting
-        # the model reason about multiple objects or spatial relationships.
-        self.spatial_attn = nn.MultiheadAttention(
-            embed_dim, num_attn_heads, batch_first=True,
+        # ── Cell embedding ────────────────────────────────────────────────
+        # +1 for the PAD sentinel (-1 mapped to index num_colours).
+        self.cell_embed = nn.Embedding(
+            num_colours + 1, embed_dim, padding_idx=num_colours,
         )
 
-        # ── Question encoder (embedding + GRU) ──────────────────────────
-        self.word_embed = nn.Embedding(vocab_size, q_embed_dim, padding_idx=0)
-        self.question_gru = nn.GRU(q_embed_dim, q_hidden_dim, batch_first=True, bidirectional=False)
-        # Project GRU hidden -> embed_dim.
-        self.question_proj = nn.Linear(q_hidden_dim, embed_dim)
+        # Learnable type embeddings to distinguish demo-input, demo-output,
+        # and test-input tokens within the same sequence.
+        self.type_embed = nn.Embedding(3, embed_dim)  # 0=demo_in, 1=demo_out, 2=test_in
 
-        # ── Multimodal fusion ────────────────────────────────────────────
-        # Element-wise product followed by a linear layer to blend modalities.
-        self.fusion_proj = nn.Sequential(
+        # 2-D sinusoidal positional encoding (registered as buffer).
+        self.register_buffer(
+            "pos_encoding",
+            _sinusoidal_pos_encoding_2d(max_grid_size, max_grid_size, embed_dim),
+        )
+
+        # ── Demo pair encoder (shared Transformer) ────────────────────────
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_attn_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.demo_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_encoder_layers,
+        )
+
+        # ── Multi-head cross-attention (test ← demo context) ─────────────
+        self.cross_attn_layers = nn.ModuleList()
+        self.cross_norms = nn.ModuleList()
+        self.cross_ffns = nn.ModuleList()
+        self.cross_ffn_norms = nn.ModuleList()
+        for _ in range(num_cross_attn_layers):
+            self.cross_attn_layers.append(
+                nn.MultiheadAttention(
+                    embed_dim, num_attn_heads, dropout=0.1, batch_first=True,
+                )
+            )
+            self.cross_norms.append(nn.LayerNorm(embed_dim))
+            self.cross_ffns.append(nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 4),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(embed_dim * 4, embed_dim),
+                nn.Dropout(0.1),
+            ))
+            self.cross_ffn_norms.append(nn.LayerNorm(embed_dim))
+
+        # ── Pooling projection ────────────────────────────────────────────
+        self.pool_proj = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
         )
@@ -124,103 +176,212 @@ class FusionModel(nn.Module):
         # ── Expert pathways ──────────────────────────────────────────────
         self.memory = RuleMemory(
             embed_dim=embed_dim,
-            num_classes=num_classes,
+            num_colours=num_colours,
             num_slots=num_rule_slots,
             rank=rule_rank,
         )
         self.rule_gen = RuleGenerator(
             embed_dim=embed_dim,
-            num_classes=num_classes,
+            num_colours=num_colours,
             rank=rule_rank,
             history_size=history_size,
         )
         self.guess = GuessComponent(
             embed_dim=embed_dim,
-            num_classes=num_classes,
+            num_colours=num_colours,
         )
 
         # ── Decision router ──────────────────────────────────────────────
         self.router = DecisionRouter(embed_dim=embed_dim)
 
+        # ── Decision hash projection ────────────────────────────────────
+        # Used to convert per-cell logits into a compact decision index
+        # for the RuleGenerator's history buffer.  A learned linear
+        # projection from the pooled logits is far less lossy than the
+        # naïve ``pred_cells.sum() % vocab_size`` approach, which suffers
+        # from massive hash collisions.
+        decision_vocab = self.rule_gen.decision_vocab_size
+        self.decision_proj = nn.Linear(
+            num_colours, decision_vocab, bias=False,
+        )
+
+    # ── Deferred history update ─────────────────────────────────────────
+
+    @torch.no_grad()
+    def update_rule_history(self, outcomes: torch.Tensor) -> None:
+        """Push the pending ``(h, decision, outcome)`` triple into the
+        RuleGenerator's history buffer.
+
+        Must be called by the training loop *after* computing the per-sample
+        loss.  Does nothing if no pending history exists (e.g. during eval).
+
+        :param outcomes: Per-sample outcome signal ``(batch,)``.
+        """
+        pending = getattr(self, "_pending_history", None)
+        if pending is None:
+            return
+        self.rule_gen.update_history(
+            pending["h"], pending["decisions"], outcomes,
+        )
+        self._pending_history = None
+
+    # ── Helper: embed a batch of grids ────────────────────────────────────
+
+    def _embed_grid(
+        self, grid: torch.Tensor, type_id: int
+    ) -> torch.Tensor:
+        """Embed a padded grid into a sequence of token vectors.
+
+        :param grid: ``(batch, H, W)`` int tensor.
+        :param type_id: Type embedding index (0=demo_in, 1=demo_out, 2=test_in).
+        :return: ``(batch, H*W, embed_dim)`` token embeddings.
+        """
+        B, H, W = grid.shape
+        safe = grid.clone()
+        safe[safe < 0] = self.num_colours
+        tokens = self.cell_embed(safe.view(B, -1))  # (B, H*W, embed_dim)
+        tokens = tokens + self.pos_encoding[:H, :W].reshape(H * W, -1).unsqueeze(0)
+        tokens = tokens + self.type_embed(
+            torch.full((1,), type_id, device=grid.device, dtype=torch.long)
+        )
+        return tokens
+
+    # ── Forward pass ──────────────────────────────────────────────────────
+
     def forward(
         self,
-        images: torch.Tensor,
-        questions: torch.Tensor,
+        demo_inputs: torch.Tensor,
+        demo_outputs: torch.Tensor,
+        demo_mask: torch.Tensor,
+        test_input: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Run the full Fusion Model forward pass.
 
-        :param images: Batch of images ``(batch, 3, 224, 224)``.
-        :param questions: Batch of tokenised questions ``(batch, max_q_len)``.
-        :return: Tuple of ``(logits, alphas, metadata)`` where *logits* has
-            shape ``(batch, num_classes)``, *alphas* has shape ``(batch, 3)``
-            and *metadata* holds per-pathway logits and retrieval info.
+        :param demo_inputs: ``(batch, max_demos, G, G)`` padded demo input grids.
+        :param demo_outputs: ``(batch, max_demos, G, G)`` padded demo output grids.
+        :param demo_mask: ``(batch, max_demos)`` boolean mask.
+        :param test_input: ``(batch, G, G)`` padded test input grid.
+        :return: Tuple of ``(logits, alphas, metadata)`` where *logits*
+            has shape ``(batch, max_output_cells, num_colours)``.
         """
-        # ── Encode image into spatial feature map ─────────────────────────
-        with torch.no_grad():
-            x = self.backbone_frozen(images)
-        feat_map = self.backbone_finetune(x)          # (batch, 512, 7, 7)
-        feat_map = self.image_proj(feat_map)           # (batch, embed_dim, 7, 7)
-        spatial = feat_map.flatten(2).permute(0, 2, 1) # (batch, 49, embed_dim)
+        B, D, H, W = demo_inputs.shape
 
-        # ── Encode question ──────────────────────────────────────────────
-        word_emb = self.word_embed(questions)  # (batch, seq_len, q_embed_dim)
-        _, q_hidden = self.question_gru(word_emb)  # q_hidden: (1, batch, q_hidden_dim)
-        q_emb = self.question_proj(q_hidden.squeeze(0))  # (batch, embed_dim)
+        # ── 1. Encode all demo pairs in one batched pass ─────────────────
+        # Instead of looping over each demo index and calling the
+        # encoder D times, we reshape all valid demos into a single
+        # batch dimension (B*D, 2*H*W, E) and run the encoder once.
+        # This gives a ~D× throughput improvement on accelerators.
+        flat_mask = demo_mask.reshape(B * D)           # (B*D,)
+        n_valid = int(flat_mask.sum().item())
 
-        # ── Multi-head spatial attention ─────────────────────────────────
-        # Each head independently attends to different spatial regions,
-        # allowing the model to focus on multiple objects or relationships.
-        img_emb, _ = self.spatial_attn(
-            query=q_emb.unsqueeze(1), key=spatial, value=spatial,
-        )                                    # (batch, 1, embed_dim)
-        img_emb = img_emb.squeeze(1)         # (batch, embed_dim)
+        if n_valid > 0:
+            # Gather all (B*D) demo grids, embed, concatenate pairs.
+            all_inp = demo_inputs.reshape(B * D, H, W)   # (B*D, H, W)
+            all_out = demo_outputs.reshape(B * D, H, W)  # (B*D, H, W)
+            all_inp_emb = self._embed_grid(all_inp, type_id=0)  # (B*D, H*W, E)
+            all_out_emb = self._embed_grid(all_out, type_id=1)  # (B*D, H*W, E)
+            all_pairs = torch.cat([all_inp_emb, all_out_emb], dim=1)  # (B*D, 2*H*W, E)
 
-        # ── Fuse modalities via element-wise product + projection ────────
-        h = self.fusion_proj(img_emb * q_emb)  # (batch, embed_dim)
+            # Run the encoder on valid demos only to avoid wasting
+            # compute on padding-only demo slots.
+            valid_idx = flat_mask.nonzero(as_tuple=True)[0]     # (n_valid,)
+            valid_pairs = all_pairs[valid_idx]                  # (n_valid, 2*H*W, E)
+            valid_encoded = self.demo_encoder(valid_pairs)      # (n_valid, 2*H*W, E)
 
-        # ── Expert pathways ──────────────────────────────────────────────
-        logits_mem, retrieval_info = self.memory(h)
-        logits_rule, confidence, proposal = self.rule_gen(h)
-        logits_guess = self.guess(h)
+            # Scatter back into the full (B*D) layout, zeros for invalid.
+            all_encoded = torch.zeros_like(all_pairs)           # (B*D, 2*H*W, E)
+            all_encoded[valid_idx] = valid_encoded
 
-        # ── Route and blend ──────────────────────────────────────────────
-        alpha = self.router(h, retrieval_info["top_key"], confidence)
+            # Reshape to (B, D*2*H*W, E) — concatenation of all demos.
+            demo_context = all_encoded.view(B, D * 2 * H * W, self.embed_dim)
+        else:
+            demo_context = torch.zeros(
+                B, 1, self.embed_dim, device=test_input.device,
+            )
 
-        # Weighted mixture: each alpha slice is (batch, 1) for broadcasting.
+        # ── 2. Embed test input ──────────────────────────────────────────
+        test_emb = self._embed_grid(test_input, type_id=2)  # (B, seq, E)
+
+        # ── 3. Multi-head cross-attention: test ← demo context ───────────
+        x = test_emb
+        for cross_attn, norm, ffn, ffn_norm in zip(
+            self.cross_attn_layers,
+            self.cross_norms,
+            self.cross_ffns,
+            self.cross_ffn_norms,
+            strict=True,
+        ):
+            attended, _ = cross_attn(query=x, key=demo_context, value=demo_context)
+            x = norm(x + attended)
+            x = ffn_norm(x + ffn(x))
+
+        # ── 4. Pool into shared embedding h ──────────────────────────────
+        pad_mask = (test_input.view(B, -1) >= 0).float()  # (B, seq)
+        pad_mask_sum = pad_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        h = (x * pad_mask.unsqueeze(-1)).sum(dim=1) / pad_mask_sum  # (B, E)
+        h = self.pool_proj(h)
+
+        # ── 5. Expert pathways (spatial) ─────────────────────────────────
+        # Each expert receives x (B, seq, E) and produces (B, seq, num_colours).
+        logits_mem, mem_repr, retrieval_info = self.memory(x, h)
+        logits_rule, confidence, rule_repr, proposal = self.rule_gen(x, h)
+        logits_guess, guess_repr = self.guess(x, h, grid_h=H, grid_w=W)
+
+        # ── 6. Route and blend ───────────────────────────────────────────
+        alpha, router_attn = self.router(h, mem_repr, rule_repr, guess_repr)
+
+        # alpha: (B, 3) → expand for per-cell blending.
         logits = (
-            alpha[:, 0:1] * logits_mem + alpha[:, 1:2] * logits_rule + alpha[:, 2:3] * logits_guess
-        )
+            alpha[:, 0:1].unsqueeze(-1) * logits_mem
+            + alpha[:, 1:2].unsqueeze(-1) * logits_rule
+            + alpha[:, 2:3].unsqueeze(-1) * logits_guess
+        )  # (B, seq, num_colours)
 
-        # ── Rule commitment ──────────────────────────────────────────────
+        # ── 7. Rule commitment (soft blend into weakest slot) ────────────
         committed = False
+        commit_weight_used = 0.0
         if self.training and proposal is not None:
-            prop_conf = proposal["confidence"]  # (batch, 1)
-            threshold = proposal["commit_threshold"]  # scalar
-            best_idx = int(prop_conf.argmax(dim=0).item())
-            best_conf = prop_conf[best_idx, 0]
+            weights = proposal["commit_weight"]  # (batch, 1)
+            best_idx = int(weights.argmax(dim=0).item())
+            w = weights[best_idx, 0].item()
 
-            if best_conf.item() > threshold.item():
-                slot = self.memory.get_lowest_utility_slot()
+            if w > 1e-3:
+                slot = self.memory.get_weakest_slot()
                 self.memory.commit_rule(
                     slot,
                     proposal["key"][best_idx],
                     proposal["A"][best_idx],
                     proposal["B"][best_idx],
+                    commit_weight=w,
                 )
                 committed = True
+                commit_weight_used = w
 
-        # ── Update history buffer with current predictions ───────────────
+        # ── 8. Stash info for deferred history update ─────────────────────
         if self.training:
-            preds = logits.detach().argmax(dim=-1)  # (batch,)
-            self.rule_gen.update_history(h, preds)
+            # Project the mean logits through a learned linear layer to
+            # produce a compact decision index.  This preserves much more
+            # information than the old ``pred_cells.sum() % vocab_size``
+            # hash, which suffered from massive collisions.
+            logits_det = logits.detach()                          # (B, seq, C)
+            mean_logits = logits_det.mean(dim=1)                  # (B, C)
+            pred_hash = self.decision_proj(mean_logits).argmax(dim=-1)  # (B,)
+            self._pending_history = {
+                "h": h.detach(),
+                "decisions": pred_hash,
+            }
 
         metadata: dict[str, Any] = {
             "logits_mem": logits_mem,
             "logits_rule": logits_rule,
             "logits_guess": logits_guess,
             "retrieval_scores": retrieval_info["scores"],
+            "memory_strength": retrieval_info["strength"],
+            "retrieval_head_attn": retrieval_info["head_attn"],
             "rule_confidence": confidence,
+            "router_attn": router_attn,
             "proposal": proposal,
             "committed": committed,
+            "commit_weight": commit_weight_used,
         }
         return logits, alpha, metadata

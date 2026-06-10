@@ -1,4 +1,4 @@
-# Re-export the CLEVR dataset so callers can write ``from tasks import CLEVRDataset``.
-from .clevr import CLEVRDataset
+# Re-export the ARC dataset so callers can write ``from tasks import ARCDataset``.
+from .arc import ARCDataset, ParquetARCDataset
 
-__all__ = ["CLEVRDataset"]
+__all__ = ["ARCDataset", "ParquetARCDataset"]

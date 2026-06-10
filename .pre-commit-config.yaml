@@ -23,5 +23,5 @@ repos:
       - id: mypy
         # Extra args forwarded to mypy.  We read config from pyproject.toml
         # automatically so no --config-file flag is needed.
-        additional_dependencies: [torch, torchvision, numpy, matplotlib, pillow]
+        additional_dependencies: [torch, numpy, matplotlib]
         args: [--ignore-missing-imports]

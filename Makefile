@@ -59,7 +59,7 @@ precommit:
 # train — launch a quick debug training run with a small data subset.
 # --------------------------------------------------------------------------
 train:
-	uv run python train.py --max_samples 100 --epochs 2 --batch_size 16
+	uv run python train.py --max_samples 20 --epochs 2 --batch_size 4
 
 # --------------------------------------------------------------------------
 # clean — remove generated artefacts.

@@ -1,8 +1,9 @@
 # Virtual environment
 .venv/
 
-# CLEVR dataset (too large for version control)
-CLEVR_v1.0/
+# ARC-AGI-2 dataset (cloned separately)
+arc-agi-2/
+data/
 
 # Python caches
 __pycache__/
