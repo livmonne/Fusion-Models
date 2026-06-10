@@ -1,8 +1,14 @@
-"""Generate a Kaggle submission.json for ARC-AGI-2.
+"""Generate a Kaggle submission.json for ARC-style challenges.
 
 Loads a challenges JSON file, runs the trained Fusion Model on each test
 pair, and writes a ``submission.json`` with two prediction attempts per
 test output.
+
+The model predicts the **output grid size** with its size head.  When the
+predicted output is larger than the test-input canvas, the sample is
+re-run on an enlarged canvas so that every output cell has a token
+position (two-pass inference); otherwise the canvas logits are simply
+cropped to the predicted size.
 
 Usage::
 
@@ -15,15 +21,55 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
+from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from fusion_model import FusionModel
-from tasks.arc import NUM_COLOURS, ChallengesDataset
+from tasks.arc import NUM_COLOURS, PAD_VALUE, ChallengesDataset, arc_collate_fn
+
+
+def challenges_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate challenge samples: dynamic padding + task bookkeeping."""
+    task_ids = [s.pop("task_id") for s in batch]
+    pair_idxs = [s.pop("test_pair_idx") for s in batch]
+    out: dict[str, Any] = arc_collate_fn(batch)
+    out["task_id"] = task_ids
+    out["test_pair_idx"] = torch.tensor(pair_idxs, dtype=torch.long)
+    return out
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
+
+
+def _predict_canvas(
+    model: FusionModel,
+    demo_inputs: torch.Tensor,
+    demo_outputs: torch.Tensor,
+    demo_mask: torch.Tensor,
+    test_input: torch.Tensor,
+    min_h: int,
+    min_w: int,
+) -> torch.Tensor:
+    """Re-run one sample on a canvas of at least ``(min_h, min_w)``.
+
+    Pads all grids (with :data:`PAD_VALUE`) so the output canvas can hold
+    a predicted output that is larger than the test input.
+
+    :return: Per-cell logits ``(1, min_h * min_w, num_colours)`` —
+        actually ``(1, H2*W2, C)`` for the enlarged canvas.
+    """
+    H, W = test_input.shape[-2], test_input.shape[-1]
+    dh, dw = max(0, min_h - H), max(0, min_w - W)
+    if dh or dw:
+        pad = (0, dw, 0, dh)  # pad last dim (W) then second-to-last (H)
+        demo_inputs = F.pad(demo_inputs, pad, value=PAD_VALUE)
+        demo_outputs = F.pad(demo_outputs, pad, value=PAD_VALUE)
+        test_input = F.pad(test_input, pad, value=PAD_VALUE)
+    logits, _, _ = model(demo_inputs, demo_outputs, demo_mask, test_input)
+    return logits
 
 
 def generate_submissions(
@@ -49,20 +95,34 @@ def generate_submissions(
             demo_outputs = batch["demo_outputs"].to(device)
             demo_mask = batch["demo_mask"].to(device)
             test_input = batch["test_input"].to(device)
-            input_size = batch["input_size"]
             task_ids = batch["task_id"]  # list of strings
             pair_idxs = batch["test_pair_idx"]  # tensor
 
-            logits, _, _ = model(demo_inputs, demo_outputs, demo_mask, test_input)
+            logits, _, meta = model(demo_inputs, demo_outputs, demo_mask, test_input)
+            size_pred = meta["size_logits"].argmax(dim=-1) + 1  # (B, 2)
+
             B = test_input.size(0)
-            G = test_input.size(1)
+            H, W = test_input.size(1), test_input.size(2)
 
             for i in range(B):
-                h, w = input_size[i].tolist()
-                if h <= 0 or w <= 0:
-                    h, w = 1, 1
+                ph, pw = int(size_pred[i, 0]), int(size_pred[i, 1])
 
-                grid_logits = logits[i].view(G, G, NUM_COLOURS)[:h, :w]
+                if ph <= H and pw <= W:
+                    grid_logits = logits[i].view(H, W, NUM_COLOURS)[:ph, :pw]
+                else:
+                    # Predicted output exceeds the canvas: re-run this
+                    # sample on an enlarged canvas (second pass).
+                    H2, W2 = max(H, ph), max(W, pw)
+                    sample_logits = _predict_canvas(
+                        model,
+                        demo_inputs[i : i + 1],
+                        demo_outputs[i : i + 1],
+                        demo_mask[i : i + 1],
+                        test_input[i : i + 1],
+                        H2,
+                        W2,
+                    )
+                    grid_logits = sample_logits[0].view(H2, W2, NUM_COLOURS)[:ph, :pw]
 
                 # attempt_1: greedy argmax
                 pred1 = grid_logits.argmax(dim=-1).cpu().tolist()
@@ -72,7 +132,7 @@ def generate_submissions(
                 scaled = flat_logits / temperature
                 probs = torch.softmax(scaled, dim=-1)
                 sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
-                pred2 = sampled.view(h, w).cpu().tolist()
+                pred2 = sampled.view(ph, pw).cpu().tolist()
 
                 results.append((
                     task_ids[i],
@@ -111,7 +171,7 @@ def build_submission(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate submission.json for ARC-AGI-2 Kaggle competition",
+        description="Generate submission.json for ARC Kaggle competitions",
     )
     parser.add_argument(
         "--challenges", type=str, required=True,
@@ -127,6 +187,7 @@ def main() -> None:
     parser.add_argument("--max_grid_size", type=int, default=30)
     parser.add_argument("--max_demos", type=int, default=5)
     parser.add_argument("--embed_dim", type=int, default=256)
+    parser.add_argument("--num_rule_slots", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_samples", type=int, default=None)
     args = parser.parse_args()
@@ -152,6 +213,7 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        collate_fn=challenges_collate,
     )
     print(f"Loaded {len(dataset)} test pairs from {args.challenges}")
 
@@ -160,6 +222,8 @@ def main() -> None:
         embed_dim=args.embed_dim,
         num_colours=NUM_COLOURS,
         max_grid_size=args.max_grid_size,
+        num_rule_slots=args.num_rule_slots,
+        max_demos=max(args.max_demos, 1),
     ).to(device)
     model.load_state_dict(
         torch.load(args.checkpoint, weights_only=True, map_location=device),

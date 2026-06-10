@@ -57,9 +57,10 @@ precommit:
 
 # --------------------------------------------------------------------------
 # train — launch a quick debug training run with a small data subset.
+# The 16x16 grid cap keeps the run within laptop (16 GB) memory budgets.
 # --------------------------------------------------------------------------
 train:
-	uv run python train.py --max_samples 20 --epochs 2 --batch_size 4
+	uv run python train.py --max_samples 40 --epochs 2 --batch_size 2 --max_grid_size 16 --num_workers 0
 
 # --------------------------------------------------------------------------
 # clean — remove generated artefacts.

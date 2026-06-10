@@ -63,9 +63,10 @@ function Precommit {
 }
 
 function Train {
-    <# Launch a quick debug training run with a small data subset. #>
+    <# Launch a quick debug training run with a small data subset.
+       The 16x16 grid cap keeps the run within laptop memory budgets. #>
     Write-Host ">> Starting debug training run..." -ForegroundColor Cyan
-    uv run python train.py --max_samples 20 --epochs 2 --batch_size 4
+    uv run python train.py --max_samples 40 --epochs 2 --batch_size 2 --max_grid_size 16 --num_workers 0
 }
 
 function Clean {

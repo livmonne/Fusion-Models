@@ -1,6 +1,6 @@
-"""ARC-AGI-2 dataset loader for grid-to-grid transformation tasks.
+"""ARC-style dataset loaders for grid-to-grid transformation tasks.
 
-The ARC-AGI-2 dataset (Chollet, 2024) consists of abstract reasoning tasks
+The ARC format (Chollet, 2019/2024) consists of abstract reasoning tasks
 where each task provides demonstration input/output grid pairs and one or
 more test inputs.  The goal is to produce the correct output grid for each
 test input by inferring the transformation rule from the demonstrations.
@@ -14,14 +14,14 @@ This module provides:
 * PyTorch ``Dataset`` classes that yield padded/flattened grid tensors
   ready for batched training.  :class:`ARCDataset` loads from a directory
   of JSON files; :class:`ParquetARCDataset` loads from one or more
-  ``.parquet`` files (e.g. the Giotto augmented dataset).
+  ``.parquet`` files (e.g. the Giotto/re-ARC augmented datasets).
 * Utility functions for padding, flattening, and reconstructing grids.
 
 Dataset structure expected on disk (JSON)::
 
     data/
-        training/       # 1000 task JSON files
-        evaluation/     # 120 task JSON files
+        training/       # task JSON files
+        evaluation/     # task JSON files (validation)
 
 Each JSON file contains ``{"train": [...], "test": [...]}`` where each
 entry has ``"input"`` and ``"output"`` grids (list of lists of ints).
@@ -39,7 +39,7 @@ from torch.utils.data import Dataset
 # ── Constants ────────────────────────────────────────────────────────────────
 NUM_COLOURS: int = 10  # cell values 0-9
 PAD_VALUE: int = -1  # padding sentinel (not a valid colour)
-MAX_GRID_SIZE: int = 30  # maximum grid dimension in ARC-AGI-2
+MAX_GRID_SIZE: int = 30  # maximum grid dimension in ARC
 
 # ── Grid utilities ───────────────────────────────────────────────────────────
 
@@ -53,10 +53,9 @@ def pad_grid(grid: list[list[int]], max_h: int, max_w: int) -> torch.Tensor:
     :return: ``int64`` tensor of shape ``(max_h, max_w)``.
     """
     h = len(grid)
-    w = len(grid[0]) if h > 0 else 0
     padded = torch.full((max_h, max_w), PAD_VALUE, dtype=torch.long)
-    for r in range(h):
-        for c in range(len(grid[r])):
+    for r in range(min(h, max_h)):
+        for c in range(min(len(grid[r]), max_w)):
             padded[r, c] = grid[r][c]
     return padded
 
@@ -81,16 +80,47 @@ def unpad_grid(padded: torch.Tensor, h: int, w: int) -> list[list[int]]:
     return padded[:h, :w].tolist()
 
 
+def task_fits(task: dict[str, Any], max_grid_size: int) -> bool:
+    """Check whether every grid in an ARC task fits within ``max_grid_size``.
+
+    Used to filter datasets when training with a reduced canvas (e.g.
+    ``--max_grid_size 16`` on memory-constrained hardware): attention cost
+    grows with the 4th power of the grid edge via the demo context, so
+    training on the small-grid subset is the main compute knob.
+
+    :param task: Task dict with ``train`` and ``test`` pair lists.
+    :param max_grid_size: Maximum allowed grid dimension.
+    :return: True when all grids fit.
+    """
+
+    def grid_ok(grid: list[list[int]] | None) -> bool:
+        if grid is None:
+            return True
+        h = len(grid)
+        w = len(grid[0]) if h > 0 else 0
+        return h <= max_grid_size and w <= max_grid_size
+
+    for pair in task.get("train", []):
+        if not grid_ok(pair.get("input")) or not grid_ok(pair.get("output")):
+            return False
+    for pair in task.get("test", []):
+        if not grid_ok(pair.get("input")) or not grid_ok(pair.get("output")):
+            return False
+    return True
+
+
 # ── Base dataset ─────────────────────────────────────────────────────────────
 
 
 class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
-    """Shared ``__getitem__`` logic for all ARC dataset variants.
+    """Shared tensorisation logic for all ARC dataset variants.
 
-    Subclasses must populate ``self.samples`` (a list of dicts with keys
-    ``task_id``, ``demos``, ``test_input``, ``test_output``) and set
-    ``self.max_grid_size`` and ``self.max_demos`` before the first call
-    to ``__getitem__``.
+    Subclasses either populate ``self.samples`` (a list of dicts with keys
+    ``task_id``, ``demos``, ``test_input``, ``test_output``) and rely on
+    the default ``__getitem__``, or override ``__getitem__`` and call
+    :meth:`_tensorise` on samples they materialise lazily.  They must set
+    ``self.max_grid_size`` and ``self.max_demos`` before the first item is
+    requested.
     """
 
     samples: list[dict[str, Any]]
@@ -101,7 +131,10 @@ class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        """Return a single sample as a dict of minimally-padded tensors.
+        return self._tensorise(self.samples[idx])
+
+    def _tensorise(self, sample: dict[str, Any]) -> dict[str, torch.Tensor]:
+        """Convert a raw sample dict into minimally-padded tensors.
 
         Grids are padded to the sample's own max dimensions (not the global
         max).  A custom collate function (:func:`arc_collate_fn`) re-pads
@@ -118,8 +151,6 @@ class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
         * ``output_size``  — ``(2,)`` int tensor ``[H, W]`` of test output
         * ``grid_dims``    — ``(2,)`` int tensor ``[H, W]`` of padded dims
         """
-        sample = self.samples[idx]
-
         # Compute per-sample max grid dims across all grids.
         all_grids: list[list[list[int]]] = []
         for demo in sample["demos"][: self.max_demos]:
@@ -179,23 +210,19 @@ class _BaseARCDataset(Dataset):  # type: ignore[type-arg]
 
 
 class ARCDataset(_BaseARCDataset):
-    """PyTorch dataset for ARC-AGI-2 grid transformation tasks (JSON files).
+    """PyTorch dataset for ARC grid transformation tasks (JSON files).
 
     Each sample represents a single *test pair* from a task, bundled with
     all of that task's demonstration pairs as context.  The model receives
     the demo inputs/outputs and the test input, and must predict the test
     output.
 
-    All grids are padded to ``(max_grid_size, max_grid_size)`` so they can
-    be batched.  A ``PAD_VALUE`` sentinel (−1) marks cells outside the
-    original grid boundaries.
-
     :param data_dir: Path to a directory of ARC task JSON files (e.g.
         ``data/training/``).
-    :param max_grid_size: Pad all grids to this square size.
+    :param max_grid_size: Clamp grids to this square size.
     :param max_demos: Maximum number of demonstration pairs to include.
         Tasks with more demos are truncated; tasks with fewer are
-        zero-padded.
+        zero-padded (and masked).
     :param max_samples: If set, only load this many samples (for debugging).
     """
 
@@ -215,14 +242,24 @@ class ARCDataset(_BaseARCDataset):
         self._load_tasks(max_samples)
 
     def _load_tasks(self, max_samples: int | None) -> None:
-        """Scan the data directory and build the sample list."""
+        """Scan the data directory and build the sample list.
+
+        Tasks containing any grid larger than ``max_grid_size`` are
+        skipped (rather than silently truncated), so a reduced canvas
+        trains on the consistent small-grid subset.
+        """
         task_files = sorted(
             f for f in os.listdir(self.data_dir) if f.endswith(".json")
         )
+        skipped = 0
         for fname in task_files:
             path = os.path.join(self.data_dir, fname)
             with open(path, encoding="utf-8") as fh:
                 task: dict[str, Any] = json.load(fh)
+
+            if not task_fits(task, self.max_grid_size):
+                skipped += 1
+                continue
 
             demos = task["train"]
             for test_pair in task["test"]:
@@ -234,16 +271,21 @@ class ARCDataset(_BaseARCDataset):
                 })
                 if max_samples is not None and len(self.samples) >= max_samples:
                     return
+        if skipped:
+            print(
+                f"Skipped {skipped} task(s) with grids larger than "
+                f"{self.max_grid_size}x{self.max_grid_size}"
+            )
 
 
-# ── Parquet dataset ──────────────────────────────────────────────────────────
+# ── Kaggle challenges dataset ────────────────────────────────────────────────
 
 
 class ChallengesDataset(_BaseARCDataset):
     """Dataset for a single Kaggle challenges JSON file.
 
-    The Kaggle ARC-AGI-2 evaluation challenges are distributed as one JSON
-    file mapping task IDs to ``{"train": [...], "test": [{"input": ...}]}``.
+    The Kaggle ARC evaluation challenges are distributed as one JSON file
+    mapping task IDs to ``{"train": [...], "test": [{"input": ...}]}``.
     Ground-truth outputs are not available, so ``test_output`` is always
     ``None``.
 
@@ -253,7 +295,7 @@ class ChallengesDataset(_BaseARCDataset):
     ``__getitem__`` so that results can be grouped back by task.
 
     :param challenges_path: Path to the challenges JSON file.
-    :param max_grid_size: Pad all grids to this square size.
+    :param max_grid_size: Clamp grids to this square size.
     :param max_demos: Maximum number of demonstration pairs to include.
     :param max_samples: If set, only load this many samples (for debugging).
     """
@@ -300,24 +342,29 @@ class ChallengesDataset(_BaseARCDataset):
         return result
 
 
+# ── Parquet dataset ──────────────────────────────────────────────────────────
+
+
 class ParquetARCDataset(_BaseARCDataset):
     """PyTorch dataset that lazily loads ARC tasks from ``.parquet`` files.
 
     Each parquet file must have columns ``id`` (string) and ``task``
     (JSON string with the standard ARC format:
-    ``{"train": [...], "test": [...]}``.  All test pairs within each task
+    ``{"train": [...], "test": [...]}``).  All test pairs within each task
     are expanded into separate samples, matching :class:`ARCDataset`
     behaviour.
 
-    **Lazy loading**: Only a lightweight index is built at init time
-    (mapping each sample to a table row + test-pair offset).  The actual
-    JSON parsing and grid construction happen on-the-fly in
-    ``__getitem__``.  This keeps RAM usage proportional to the compressed
-    parquet size (~1.3 GB for the full Giotto dataset) rather than the
-    fully materialised Python objects (~95 GB).
+    **Lazy, worker-safe loading**: a lightweight index is built once at
+    init (mapping each sample to a file + row + test-pair offset), after
+    which the parquet tables are released.  Each process — the main
+    process or a DataLoader worker — re-opens the files on first access
+    and caches its own handle, so spawned workers (the macOS default) do
+    not inherit multi-gigabyte pickled tables.  JSON parsing and grid
+    construction happen on-the-fly per sample, keeping RAM proportional to
+    the parquet file size rather than the materialised Python objects.
 
     :param parquet_paths: List of paths to ``.parquet`` files to load.
-    :param max_grid_size: Pad all grids to this square size.
+    :param max_grid_size: Clamp grids to this square size.
     :param max_demos: Maximum number of demonstration pairs to include.
     :param max_samples: If set, only index this many samples (for
         debugging).
@@ -333,42 +380,77 @@ class ParquetARCDataset(_BaseARCDataset):
         super().__init__()
         self.max_grid_size = max_grid_size
         self.max_demos = max_demos
+        self.parquet_paths = list(parquet_paths)
 
-        # Populated by _build_index; not used by __getitem__ (lazy).
+        # Unused by this subclass (kept for the base-class contract).
         self.samples: list[dict[str, Any]] = []
 
-        self._tables: list[Any] = []  # pyarrow Tables kept in memory
-        self._index: list[tuple[int, int, int]] = []  # (table_idx, row_idx, test_pair_idx)
-        self._build_index(parquet_paths, max_samples)
+        # Per-process table cache; never pickled to workers.
+        self._tables: dict[int, Any] = {}
+        self._index: list[tuple[int, int, int]] = []  # (file_idx, row_idx, test_pair_idx)
+        self._build_index(max_samples)
 
-    def _build_index(
-        self, parquet_paths: list[str], max_samples: int | None
-    ) -> None:
-        """Scan parquet files and build a sample index without materialising grids."""
-        import pyarrow.parquet as pq
+    # ── Pickling: drop the table cache so workers re-open lazily ─────────
 
-        for path in parquet_paths:
-            table = pq.read_table(path, columns=["id", "task"])
-            t_idx = len(self._tables)
-            self._tables.append(table)
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_tables"] = {}
+        return state
 
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+
+    # ── Index construction ────────────────────────────────────────────────
+
+    def _open_table(self, file_idx: int) -> Any:
+        """Open (and cache) the parquet table for *file_idx* in this process."""
+        table = self._tables.get(file_idx)
+        if table is None:
+            import pyarrow.parquet as pq
+
+            table = pq.read_table(
+                self.parquet_paths[file_idx], columns=["id", "task"],
+            )
+            self._tables[file_idx] = table
+        return table
+
+    def _build_index(self, max_samples: int | None) -> None:
+        """Scan parquet files and build a sample index without materialising grids.
+
+        Tasks containing any grid larger than ``max_grid_size`` are
+        skipped, mirroring :class:`ARCDataset` behaviour.
+        """
+        skipped = 0
+        for file_idx in range(len(self.parquet_paths)):
+            table = self._open_table(file_idx)
             tasks_col = table.column("task")
             for row_idx in range(len(table)):
-                # Quick parse to count test pairs only.
+                # Quick parse to count test pairs / check grid sizes only.
                 task: dict[str, Any] = json.loads(tasks_col[row_idx].as_py())
+                if not task_fits(task, self.max_grid_size):
+                    skipped += 1
+                    continue
                 n_test = len(task.get("test", []))
                 for tp_idx in range(n_test):
-                    self._index.append((t_idx, row_idx, tp_idx))
+                    self._index.append((file_idx, row_idx, tp_idx))
                     if max_samples is not None and len(self._index) >= max_samples:
+                        self._tables.clear()
                         print(
                             f"Indexed {len(self._index)} samples from "
-                            f"{len(self._tables)} parquet file(s) (capped)"
+                            f"{len(self.parquet_paths)} parquet file(s) (capped)"
                         )
                         return
 
+        # Release tables: each process re-opens what it needs on demand.
+        self._tables.clear()
+        if skipped:
+            print(
+                f"Skipped {skipped} task(s) with grids larger than "
+                f"{self.max_grid_size}x{self.max_grid_size}"
+            )
         print(
             f"Indexed {len(self._index)} samples from "
-            f"{len(self._tables)} parquet file(s)"
+            f"{len(self.parquet_paths)} parquet file(s)"
         )
 
     # ── Overrides ─────────────────────────────────────────────────────────
@@ -378,8 +460,8 @@ class ParquetARCDataset(_BaseARCDataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         """Parse one task on-the-fly and return padded tensors."""
-        t_idx, row_idx, tp_idx = self._index[idx]
-        table = self._tables[t_idx]
+        file_idx, row_idx, tp_idx = self._index[idx]
+        table = self._open_table(file_idx)
 
         task_json: str = table.column("task")[row_idx].as_py()
         task: dict[str, Any] = json.loads(task_json)
@@ -390,12 +472,7 @@ class ParquetARCDataset(_BaseARCDataset):
             "test_input": task["test"][tp_idx]["input"],
             "test_output": task["test"][tp_idx].get("output"),
         }
-
-        # Temporarily stash sample for base class __getitem__.
-        self.samples = [sample]
-        result = super().__getitem__(0)
-        self.samples = []
-        return result
+        return self._tensorise(sample)
 
 
 # ── Collate function ────────────────────────────────────────────────────────

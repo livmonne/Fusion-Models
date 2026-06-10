@@ -1,40 +1,52 @@
-# Fusion Model — Abstract Reasoning on ARC-AGI-2
+# Fusion Model — Few-Shot Abstract Reasoning on Grid Tasks
 
 A neural architecture that combines **rule memory**, **rule generation**,
-**deep spatial guessing** (with local attention and FiLM conditioning), and
-a **learned decision router** into a single end-to-end trainable model,
-applied to the [ARC-AGI-2](https://github.com/arcprize/ARC-AGI-2) abstract
-reasoning benchmark.
+a **history-based rule proposer**, and **deep spatial guessing** into a
+single end-to-end trainable model, arbitrated by a **learned decision
+router** that is grounded in **measured demo verification**.  Developed
+and tested on the ARC format ([ARC-AGI](https://github.com/fchollet/ARC-AGI) /
+[ARC-AGI-2](https://github.com/arcprize/ARC-AGI-2)), but the architecture
+applies to any few-shot grid-transformation domain.
 
-## What is ARC-AGI-2?
+## The Task Format
 
-ARC-AGI-2 (Abstraction and Reasoning Corpus) is a benchmark designed to
-test an AI's ability to *generalise* from very few examples.  Each task
-gives you a handful of **demonstration pairs** — an input grid and the
-correct output grid — plus a fresh **test input**.  Your job is to figure
-out the hidden transformation rule from the demos and apply it to the test
-input to produce the right output.
+Each task gives the model a handful of **demonstration pairs** — an input
+grid and the correct output grid — plus a fresh **test input**.  The model
+must infer the hidden transformation rule from the demos and apply it to
+the test input in a single forward pass.
 
 Grids are small rectangular matrices (up to 30×30) of integers 0–9,
-visualised as coloured cells.  There are 10 possible colours.
+visualised as coloured cells.  **The output grid's size may differ from
+the input's** — the model predicts the output dimensions too.
 
 **Why is it hard?**  Unlike typical ML benchmarks where you can memorise
-statistical patterns across thousands of examples, each ARC task is
+statistical patterns across thousands of examples, each task is
 essentially a *new puzzle*.  The model must learn to learn — extracting a
-rule from just 2–5 examples and applying it in a single forward pass.
+rule from just 2–5 examples and applying it immediately.
 
 ## High-Level Idea
 
-The Fusion Model tackles this by running **three specialist pathways** in
-parallel and letting a **router** decide how to blend their answers:
+The Fusion Model runs **four specialist pathways** in parallel and lets a
+**router** decide how to blend their answers:
 
-1. **RuleMemory** — a persistent bank of reusable rules learned over time.
-2. **RuleGenerator** — invents brand-new one-shot rules on the fly.
-3. **GuessComponent** — a deep pattern-matcher that handles anything too
-   fuzzy for explicit rules.
+1. **RuleMemory** (`mem`) — a persistent bank of reusable rules learned
+   over time, retrieved by matching the current *task*.
+2. **RuleGenerator** (`rule`) — invents a brand-new one-shot rule on the
+   fly from the current task embedding.
+3. **RuleProposer** (`prop`) — synthesises a rule from a buffer of *past
+   attempts and their outcomes* — the module that learns from its own
+   mistakes.  Its rule is **tried on every input** (it is a routed
+   pathway), and rules that demonstrably work are committed into the
+   RuleMemory bank.
+4. **GuessComponent** (`guess`) — a deep pattern-matcher that handles
+   anything too fuzzy for explicit rules.
 
-The final output is a weighted mixture of all three, where the weights are
-learned per-input by the router.
+The final output is a weighted mixture of all four, where the weights are
+produced per-input by the router — informed by both learned signals *and*
+each pathway's **measured ability to reproduce a held-out demonstration**
+(leave-one-out verification).  Verification is what makes "rule" mean
+something: a rule is good if and only if it reproduces demos it did not
+see.
 
 ## Architecture
 
@@ -47,177 +59,131 @@ Demo Pairs (input/output grids)                Test Input Grid
   Cell Embedding (10 colours → embed_dim)        Cell Embedding
   + 2-D Sinusoidal Positional Encoding           + 2-D Pos Enc
   + Type Embedding (demo_in / demo_out)          + Type Embed (test_in)
+  + Demo-Index Embedding                              │
        │                                              │
-  ┌────┴────┐                                         │
-  │ Concat  │  (input + output tokens per demo)       │
-  │ pair    │                                         │
-  └────┬────┘                                         │
+  Transformer Encoder (per pair,                      │
+  padding masked, × N layers)                         │
        │                                              │
-  Transformer Encoder                                 │
-  (self-attention × N layers)                         │
+       ├── masked mean per pair ──► t (task embedding,│B, E)
+       │                            "what is the rule?"
        │                                              │
-  Demo Context (all demo tokens concatenated)         │
+  Demo Context (all demo tokens, pad-masked)          │
        │                                              │
        └── Multi-Head Cross-Attention (× N layers) ──┘
            test tokens query demo context
                       │
-               x = cross-attended test tokens
-                   (batch, seq, embed_dim)
+               x = cross-attended test tokens (B, seq, E)
+               h = masked mean pool → instance embedding (B, E)
                       │
-              ┌───────┴────────┐
-              │                │
-              │         Mean Pool (mask padding)
-              │                │
-              │         pool_proj (embed_dim → embed_dim)
-              │                │
-              │                h  (pooled embedding, batch, embed_dim)
-              │                │
-       ┌──────┼────────────────┼──────────────────┐
-       ▼      ▼                ▼                   ▼
-  RuleMemory(x, h)    RuleGenerator(x, h)  GuessComponent(x, h, H, W)
-  (MH cross-attn
-   retrieval, 4 heads)
-       │                    │                      │
-  (B, seq, 10)        (B, seq, 10)           (B, seq, 10)
-  + mem_repr (B,E)    + rule_repr (B,E)      + guess_repr (B,E)
-       │                    │                      │
-       ▼                    ▼                      ▼
-       ┌────────────────────┼──────────────────────┐
-       │  DecisionRouter (multi-head cross-attention, 4 heads)
-       │  query  = h
-       │  keys   = [mem_repr, rule_repr, guess_repr]
-       │  values = [mem_repr, rule_repr, guess_repr]
-       │              │
-       │  ┌───────────┴───────────┐
-       │  │  MHA context (256)    │  per-head attn weights
-       │  │       │               │  (batch, 4, 3) — logged
-       │  │       + h (residual)  │
-       │  │       │               │
-       │  │  LayerNorm (256)      │
-       │  │       │               │
-       │  │  MLP (256→256→3)      │
-       │  │  Linear→GELU→Linear   │
-       │  │       │               │
-       │  │  softmax / τ          │
-       │  └───────┴───────────────┘
-       │       α (batch, 3)
-       └──────────────┘
-                      │
-     Blended logits = α₀·logits_mem + α₁·logits_rule + α₂·logits_guess
-     Per-cell colour predictions: (batch, seq, 10)
+       ┌──────────────┼──────────────────┬─────────────────┐
+       ▼              ▼                  ▼                 ▼
+  RuleMemory      RuleGenerator     RuleProposer      GuessComponent
+  (x, t)          (x, t)            (x, history)      (x, t, H, W)
+  retrieve slots  generate A,B      synthesise A,B    local/global attn
+  blend low-rank  one-shot          from past         + FiLM(t)
+  corrections     correction        (task, decision,
+       │              │              outcome) triples     │
+  head(x + corr)  head(x + corr)    head(x + corr)    MLP head
+       │              │                  │                │
+  (B, seq, 10) + pooled representation for the router (each pathway)
+       │              │                  │                │
+       └──────────────┴────────┬─────────┴────────────────┘
+                               │
+        Leave-one-out verification (optional, default on):
+        hold out one demo, predict its output with all four
+        pathways → per-pathway fit = −CE on the held-out demo
+                               │
+       DecisionRouter: multi-head cross-attention (query = h,
+       keys/values = pathway reprs) → MLP → logits
+       + fit_scale · fit  →  softmax / τ  →  α (B, 4)
+                               │
+     Blended logits = α₀·mem + α₁·rule + α₂·prop + α₃·guess
+     Per-cell colour predictions (B, seq, 10)
+                               │
+     Size head: MLP([t ‖ h]) → output height & width logits
 ```
 
 ### Components at a Glance
 
 | Component | What it does (one sentence) |
 |---|---|
-| **Cell Embedding + Pos Enc** | Converts each grid cell (0–9) into a vector, adds 2-D positional info so the model knows where each cell sits. |
-| **Transformer Encoder** | Reads concatenated demo input+output pairs via self-attention so the model can understand *how* the input was transformed. |
-| **Multi-Head Cross-Attention** | Lets the test input tokens "ask questions" of the demo context — this is the core mechanism that transfers the inferred rule to the test input. |
-| **RuleMemory** | A persistent bank of 128 reusable low-rank rules, each with a learned trigger.  Rules are matched via **multi-head cross-attention** (4 heads by default) and applied per-cell.  Slot strength decays and reinforces over time (biologically-inspired). |
-| **RuleGenerator** | Invents a one-shot low-rank correction on the fly and maintains a history of past attempts to propose persistent rules for the memory bank. |
-| **GuessComponent** | A deep spatial predictor: a stack of Transformer layers that alternate between *local* (windowed) and *global* self-attention, with FiLM conditioning from the pooled task embedding `h`, followed by a per-cell MLP head. |
-| **DecisionRouter** | Uses multi-head cross-attention to decide how much weight each pathway gets.  Produces per-input routing coefficients `α ∈ [0, 1]³` that sum to 1. |
+| **Cell Embedding + Pos Enc** | Converts each grid cell (0–9) into a vector; adds 2-D positional, grid-type, and demo-index information. |
+| **Transformer Encoder** | Reads concatenated demo input+output pairs via self-attention (padding masked) so the model can understand *how* the input was transformed. |
+| **Task embedding `t`** | Masked mean of the encoded demo pairs — a summary of the *transformation* itself, independent of the test instance; conditions retrieval, generation, and FiLM. |
+| **Multi-Head Cross-Attention** | Lets the test input tokens "ask questions" of the demo context — the core mechanism that transfers the inferred rule to the test input. |
+| **RuleMemory** | A persistent bank of low-rank rules (64 slots by default), each with a learned trigger key; retrieved via multi-head cross-attention from `t`, blended, and decoded through a residual base path.  Slot strength decays and reinforces over time (biologically-inspired). |
+| **RuleGenerator** | Generates a one-shot low-rank correction from `t` — a fresh hypothesis for this specific task. |
+| **RuleProposer** | Cross-attends over a circular history of `(task, decision, outcome)` triples to synthesise a rule from *what worked before*; the rule is applied as a fourth routed pathway, and successful ones are committed to RuleMemory. |
+| **GuessComponent** | A deep spatial predictor: Transformer layers alternating *local* (windowed) and *global* self-attention, FiLM-conditioned on `t`. |
+| **Verification** | Holds out one demonstration, predicts its output with every pathway, and measures the real cross-entropy — a grounded quality signal for routing and an extra training signal for all pathways. |
+| **Size head** | Predicts the output grid's height and width from `[t ‖ h]` — required because outputs frequently differ in size from inputs. |
+| **DecisionRouter** | Multi-head cross-attention over pathway representations plus the measured verification fit, producing routing coefficients `α ∈ [0, 1]⁴` that sum to 1. |
 
 ---
 
 ## Component Deep Dives
 
-### 1. Grid Encoding (Cell Embedding + Positional Encoding)
+### 1. Grid Encoding
 
-Before anything else, raw grid values need to be turned into vectors the
-model can process.
+- **Cell embedding**: a lookup table maps each colour value (0–9) to a
+  learned vector of size `embed_dim` (default 256).  Padding cells
+  (value −1) map to a dedicated PAD embedding.
+- **2-D sinusoidal positional encoding**: the first half of each vector
+  encodes the row position, the second half the column.
+- **Type embedding**: distinguishes demo-input, demo-output, and
+  test-input grids.
+- **Demo-index embedding**: distinguishes tokens from different
+  demonstrations inside the concatenated demo context, so the model can
+  align patterns *within* a single demo pair.
 
-- **Cell embedding**: a standard lookup table (`nn.Embedding`) maps each
-  colour value (0–9) to a learned vector of size `embed_dim` (default 256).
-  Padding cells (value −1) map to a special PAD embedding.
-- **2-D sinusoidal positional encoding**: following the classic Transformer
-  approach but extended to 2D — the first half of each vector encodes the
-  row position, the second half encodes the column.  This gives the model
-  spatial awareness without learning anything.
-- **Type embedding**: a small learned embedding distinguishes three roles —
-  demo input, demo output, and test input — so the model knows what kind
-  of grid it's looking at.
-
-The result is a sequence of token vectors `(batch, H×W, embed_dim)` for
-each grid.
-
-### 2. Demo Pair Encoding (Transformer Encoder)
+### 2. Demo Pair Encoding and the Task Embedding `t`
 
 For each demonstration pair, the input and output token sequences are
-concatenated into one long sequence and fed through a shared Transformer
-encoder (4 layers of self-attention by default).  This allows the model to
-learn correspondences between input cells and output cells *within* each
-demo.
+concatenated and fed through a shared Transformer encoder with
+**key-padding masks** (padding cells are excluded from attention).  Two
+products come out of this stage:
 
-All encoded demo sequences are then concatenated across demos into a
-single **demo context** tensor.
+- the **demo context** — all encoded demo tokens, used as keys/values for
+  cross-attention (absent demos and padding cells are masked);
+- the **task embedding `t`** — each pair is masked-mean-pooled, the pools
+  are averaged over valid demos, and the result is projected.  Because
+  `t` is built *purely from the demonstrations*, it describes the
+  transformation rule rather than any particular input — which is exactly
+  the right key for rule retrieval and generation.  (The *instance*
+  embedding `h`, pooled from the cross-attended test tokens, is kept
+  separate and used for routing and size prediction.)
 
 ### 3. Cross-Attention (Test ← Demo Context)
 
 The test input tokens cross-attend to the demo context over multiple
-layers (4 by default).  In cross-attention, the test tokens are the
-**queries** and the demo context provides the **keys** and **values**.
-
-Think of it this way: each test cell is asking "given what I saw in the
-demos, what should I become?"  Each cross-attention head can focus on a
-different aspect — one head might track colour mappings, another might
-track spatial shifts.
-
-After cross-attention, we have:
-- `x` — per-cell spatial tokens `(batch, seq, embed_dim)`
-- `h` — a global summary vector obtained by mean-pooling `x` (masking out
-  padding) and projecting it through a small MLP.
-
-Both `x` and `h` are passed to all three expert pathways.
+layers (4 by default), with invalid context positions masked.  Each test
+cell asks "given what I saw in the demos, what should I become?"
 
 ### 4. Expert Pathway: RuleMemory
 
 **Idea**: store a library of reusable transformation rules and look up the
-right ones for each input.
+right ones for each task.
 
-Each of the 128 memory slots stores:
-- A **key** (trigger embedding) — controls *when* this rule fires.
-- Two small matrices **A** and **B** — their product `A @ (B @ x)` is a
-  low-rank correction applied to each token.  This is the same idea as
-  LoRA: instead of a full weight matrix, we store two thin factors.
-- A **classification head** — converts the corrected embedding into
-  per-cell colour logits.
+Each memory slot stores a **key** (trigger embedding) and two thin
+matrices **A, B** whose product `A @ (B @ x)` is a LoRA-style low-rank
+correction applied per token.  Retrieval is **multi-head cross-attention**
+from the task embedding `t` over the key bank: each head independently
+assesses relevance and a learned combination merges them into per-slot
+scores.
 
-#### Multi-Head Cross-Attention Retrieval
-
-Retrieval uses **multi-head cross-attention** (4 heads by default) rather
-than a single dot-product.  The pooled task embedding `h` is the *query*;
-the slot keys serve as both *keys* and *values* through separate learned
-projections.
+The score-weighted blend of slot corrections is added back onto the token
+stream and decoded by a shared head:
 
 ```
-h  (B, E) ──► Q projection ──► Q (B, H, head_dim) ─┐
-                                                     ├─► scaled dot-product attention
-keys (S, E) ──► K projection ──► K (S, H, head_dim) ─┘
-            ──► V projection ──► V (S, H, head_dim)
-                                        │
-                          softmax per head → head_attn (B, H, S)
-                                │                    │
-                         weighted sum of V      learned head combination
-                                │                    │
-                        retrieved (B, H, D)     scores (B, S)
-                                │
-                    concat heads → out_proj → context (B, E)
+logits_mem = head(LayerNorm(x + Σ_s score_s · A_s(B_s x)))
 ```
 
-**Why multiple heads?**  A single dot-product compresses "relevance" into
-one number per slot.  With *H* heads, the model gets *H* independent
-channels to assess relevance — one head might attend to colour
-transformations, another to spatial layout, a third to symmetry patterns.
-The per-head attention maps are merged into final slot scores via a
-*learned* head-combination vector (softmax over `H` learnable weights),
-so the model can up-weight the most informative heads over training.
-
-The cross-attention also produces a **context vector** (the standard MHA
-output) that is added to the mean-pooled blended correction and
-LayerNorm'd before being passed to the decision router.  This gives the
-router a richer signal about what the memory pathway found.
+The **residual base path** matters: an earlier design decoded each slot's
+correction in isolation, which forced every prediction through a rank-16
+bottleneck (LoRA without the base weights) and structurally handicapped
+the rule pathways against the guess pathway.  Blending before decoding
+also avoids materialising a `(batch, seq, slots, embed)` tensor, keeping
+peak memory low.
 
 **Memory strength** is modulated by two signals inspired by neuroscience:
 
@@ -226,136 +192,151 @@ router a richer signal about what the memory pathway found.
 | **Frequency** | How often a slot is used | Running accumulator with learnable decay + reinforcement rates |
 | **Recency** | How recently a slot was activated | Exponential decay with a learnable half-life |
 
-`strength = frequency × recency` — slots that are rarely used or haven't
-been triggered recently will fade, and once they drop below a threshold
-they are **pruned** (reset with fresh random parameters), recycling
-capacity for new rules.
-
-All three dynamics parameters (decay rate, reinforcement rate, half-life)
-are **learnable** — the model discovers its own optimal
-forgetting/consolidation schedule via gradient descent.
+`strength = frequency × recency` — weak slots fade and are eventually
+**pruned** (reset to a no-op rule), recycling capacity.  The dynamics are
+**tuned to the slot count**: retrieval scores are a softmax, so the mean
+slot score is `1/num_slots`; the reinforcement rate is initialised so an
+average slot equilibrates at strength ≈ 0.5 rather than hovering at the
+prune threshold, and the recency-activation threshold is *relative* to
+the uniform share (2× by default).  Pruning runs rarely (every 500 steps)
+because it resets parameters the optimiser still has momentum for.
 
 ### 5. Expert Pathway: RuleGenerator
 
 **Idea**: sometimes no stored rule fits, so we invent one on the spot.
 
-An MLP takes the pooled `h` and directly outputs A and B matrices for a
-one-shot low-rank correction, plus a scalar confidence.  The correction is
-applied per-token just like in RuleMemory, but it exists only for this
-forward pass.
+An MLP takes the task embedding `t` and outputs A and B matrices for a
+one-shot low-rank correction.  The correction is applied per token and
+decoded through the same residual base-path pattern
+(`head(LayerNorm(x + correction))`).  It exists only for this forward
+pass.
 
-The generator also maintains a **circular history buffer** of recent
-`(embedding, decision, outcome)` triples.  A three-stage cross-attention
-pipeline — operating entirely on history, *not* the current input —
-proposes persistent rules:
+### 6. Expert Pathway: RuleProposer (history → rule, tried every step)
 
-1. Historical embeddings attend over historical decisions.
-2. That result attends over outcome signals (per-sample loss).
+**Idea**: keep a record of what was attempted and how it went, and distil
+recurring successes into explicit rules.  This is the pathway that *learns
+from its own mistakes*.
+
+The proposer maintains a **circular history buffer** of
+`(task, decision, outcome)` triples:
+
+- **task** — the task embedding `t` of a past sample;
+- **decision** — what the model did: the colour histogram of its
+  prediction concatenated with the routing weights `α` (which pathway it
+  trusted);
+- **outcome** — the per-sample task loss, **standardised over the buffer
+  at read time** so the proposer sees relative quality rather than the
+  shrinking absolute loss scale.
+
+A three-stage cross-attention pipeline — operating entirely on history,
+*not* the current input — synthesises a rule `(key, A, B)`:
+
+1. Historical task embeddings attend over historical decisions.
+2. The result attends over the standardised outcome signals.
 3. A learned synthesis query fuses the two.
 
-The output is a proposed rule (key, A, B) plus a soft **commit weight**.
-During training, the proposed rule is **soft-blended** into the weakest
-memory slot, giving the bank a warm start for newly discovered patterns.
+**The crucial design point:** the proposed rule is **applied to the
+current input** and decoded into its own per-cell logits
+(`head(LayerNorm(x + correction))`), which the router can select and the
+auxiliary loss grades.  The proposer therefore "tries" a rule on every
+forward pass, and task gradient flows back through the entire
+history-attention pipeline.  (An earlier revision only consumed proposals
+through a no-grad commit, which left the proposer's rule content
+untrained — the machinery looked sophisticated but learned nothing.)
 
-### 6. Expert Pathway: GuessComponent (Deep Spatial Predictor)
+**Commitment** into RuleMemory is **outcome-gated and deferred**.  After
+the backward pass, the training loop hands the model the proposal
+pathway's *measured* per-sample loss (`model.apply_outcomes`).  A rule is
+committed only when the best sample in the batch beat an exponential
+moving average of recent proposal losses — i.e. rules are stored because
+they demonstrably worked, not because a similarity heuristic fired.  A
+learned commit weight (regularised toward a target rate) controls the
+soft blend into the weakest memory slot.  Deferring commits to the
+optimiser-step boundary also keeps the in-place slot update from
+corrupting gradients mid-step.
 
-**Idea**: not every pattern can be captured by a crisp rule.  Sometimes
-the model needs to "just look at the grid and figure it out."
+The proposal pathway activates once the history buffer holds
+`min_history` entries (64 by default); until then the router masks its
+weight to exactly zero.
 
-The GuessComponent is a stack of Transformer layers (3 by default) with
-two key design choices:
+### 7. Expert Pathway: GuessComponent
 
-1. **Alternating local/global attention** — even-numbered layers restrict
-   each token to attending only within a *window* on the original 2-D grid
-   (Chebyshev distance, default radius 3 cells).  This forces fine-grained
-   local pattern detection.  Odd-numbered layers use standard unrestricted
-   global attention for long-range integration.  The alternation gives the
-   model both close-up and birds-eye views.
+**Idea**: not every pattern can be captured by a crisp rule.
 
-2. **FiLM conditioning** — after each layer, the pooled task embedding `h`
-   is used to compute per-token scale (`gamma`) and shift (`beta`)
-   parameters via Feature-wise Linear Modulation.  This injects global
-   task context (the same signal the other pathways receive) into the
-   spatial representations, so the guess pathway knows *what kind of task*
-   it's working on.
+A stack of Transformer layers (3 by default) with:
 
-After the layer stack, a per-token MLP head maps to `num_colours` logits,
-and the tokens are mean-pooled into a representation for the router.
+1. **Alternating local/global attention** — even layers restrict
+   attention to a Chebyshev-distance window on the 2-D grid; odd layers
+   are global.  Padding cells are masked out of attention (every token
+   keeps its self-connection, so no attention row is ever fully masked).
+2. **FiLM conditioning** — after each layer, the task embedding `t`
+   produces per-channel scale and shift, injecting "what kind of task is
+   this" into the spatial representations.
 
-### 7. DecisionRouter (Multi-Head Cross-Attention Routing)
+### 8. Leave-One-Out Verification (grounded routing)
 
-The router decides how much each expert contributes to the final answer.
+The demonstrations contain ground truth the model can check itself
+against — the architecture uses them for exactly that:
 
-**Why cross-attention instead of a simple MLP?**  With an MLP, the routing
-decision would be a static function of concatenated representations.
-Cross-attention is fundamentally different: `h` acts as a *query* that
-asks each pathway "what can you offer for this input?"  The routing
-decision is therefore **input-dependent by construction**.
+1. One demonstration `d*` is held out (random per sample during training;
+   averaged over all demos during evaluation).
+2. Its tokens are removed from the cross-attention context and the task
+   pooling; its *input* grid is embedded like a test input and
+   cross-attended to the remaining demos.
+3. All four pathways predict the held-out *output*, and the per-pathway
+   cross-entropy is measured.
 
-How it works:
+The measured fit (centred negative CE) is:
 
-1. **Multi-head attention** (4 heads) — `h` queries the 3 pathway
+- **fed to the router** through a learned scale — an *objective* "this
+  pathway actually reproduced a demo it didn't see" signal on top of the
+  learned routing; and
+- **added to the loss** — every pathway is trained to transform held-out
+  demo inputs into demo outputs, which is a free, perfectly-labelled
+  augmentation of exactly the right skill.
+
+Samples with fewer than two demonstrations skip verification (their fit
+is zero and they are excluded from the verification loss).  Disable with
+`--no_verify` to save ~40% step time at the cost of the grounded signal.
+
+### 9. Output Size Head
+
+A small MLP reads `[t ‖ h]` and classifies the output grid's height and
+width (1–30 each).  At inference, predictions are cropped to the
+predicted size; when the predicted output exceeds the test-input canvas,
+the sample is re-run on an enlarged canvas so every output cell has a
+token position (two-pass inference in `submit.py`).
+
+### 10. DecisionRouter
+
+The router decides how much each expert contributes:
+
+1. **Multi-head attention** — `h` queries the four pathway
    representations (key = value = pathway pooled outputs).
-2. **Residual + LayerNorm** — adds `h` back and normalises.
-3. **Two-layer MLP** — maps to 3 logits (one per pathway).
-4. **Temperature-scaled softmax** — produces routing weights
-   `α ∈ [0, 1]³` that sum to 1.  The temperature is learnable.
+2. **Residual + LayerNorm**, then a **two-layer MLP** maps to 4 logits.
+3. **Verification bias** — `fit_scale · fit` is added to the logits when
+   verification ran.
+4. **Temperature-scaled softmax** produces `α ∈ [0, 1]⁴`; the inactive
+   proposal pathway is masked to exactly zero.
 
-The final prediction: `logits = α₀·logits_mem + α₁·logits_rule + α₂·logits_guess`.
-
----
-
-## How the Pieces Fit Together
-
-The architecture follows a **perceive → specialise → arbitrate** pipeline:
-
-1. **Perceive** — grid cells are embedded with positional and type
-   information.  Demo pairs are encoded by a shared Transformer encoder.
-   Cross-attention transfers the inferred transformation from demos to the
-   test input, producing spatial tokens `x (batch, seq, E)`.
-
-2. **Pool** — the cross-attended test tokens are masked mean-pooled
-   (ignoring padding cells) and then projected through a learned linear
-   layer + GELU activation to produce the global summary vector
-   `h (batch, E)`.  Both `x` and `h` are passed downstream.
-
-3. **Specialise** — three expert pathways process the spatial tokens `x`
-   independently (all also receive `h`), each producing per-cell colour
-   logits `(batch, seq, 10)`:
-   - **RuleMemory** retrieves and applies stored rules per token.
-   - **RuleGenerator** synthesises one-shot rules and applies them per
-     token.
-   - **GuessComponent** runs deep local/global attention with FiLM for
-     fuzzy pattern matching.
-
-4. **Arbitrate** — the DecisionRouter uses multi-head cross-attention
-   (querying each expert's pooled representation with `h`) to produce
-   per-sample routing weights `α`.  The final prediction is a soft
-   mixture: `logits = α₀·mem + α₁·rule + α₂·guess` applied per cell.
-
-5. **Output** — the blended logits are per-cell colour predictions
-   `(batch, seq, num_colours)` for the output grid.
-
-6. **Consolidate** (training only) — the RuleGenerator proposes new rules
-   for permanent storage in the RuleMemory.  The per-sample loss is fed
-   back into the history buffer as an outcome signal so the proposer can
-   learn which input→decision pairings were effective.
+Final prediction: `logits = α₀·mem + α₁·rule + α₂·prop + α₃·guess`.
 
 ---
 
 ## Loss Function
 
-The training objective balances seven terms.  Each addresses a specific
-failure mode:
+The training objective balances nine terms:
 
 | Term | What it penalises | Why it matters |
 |---|---|---|
 | **Task loss** | Per-cell cross-entropy (ignoring padding) | Main learning signal — predict the right colours |
-| **Guess penalty** | `mean(α_guess)` | Prevents the model from being lazy and always falling back on guessing |
-| **Storage cost** | Approximate L0 over slot usage | Encourages sparse, specialised memory slots instead of using them all |
-| **Entropy bonus** | Negative `H(α)` | Prevents routing collapse — keeps all pathways active early in training |
-| **Auxiliary losses** | Per-cell CE on each pathway's *own* logits | Keeps all pathways learning even when the router is ignoring one |
-| **Commitment reg.** | Deviation from target commit rate | Prevents the rule proposer from committing too aggressively (or never) |
+| **Size loss** | CE on predicted output height/width | Without it, only same-size transformations are possible |
+| **Verification loss** | Per-pathway CE on the held-out demo | Trains every pathway to actually *reproduce* demonstrations |
+| **Guess penalty** | `mean(α_guess)` | Prevents lazily falling back on pattern matching |
+| **Storage cost** | Entropy of the retrieval distribution | Peaky retrieval = specialised slots (an earlier `u·(1−u)` form rewarded winner-take-all collapse) |
+| **Entropy bonus** | Negative `H(α)` | Prevents routing collapse — keeps pathways alive early |
+| **Auxiliary losses** | Per-cell CE on each pathway's *own* logits | Keeps all pathways learning even when the router ignores one |
+| **Commitment reg.** | Deviation from target commit rate | Prevents the proposer from committing too aggressively (or never) |
 | **Strength reg.** | Deviation from target mean strength | Prevents total amnesia or total saturation of memory slots |
 
 ---
@@ -366,7 +347,7 @@ failure mode:
 # Install dependencies (requires uv: https://docs.astral.sh/uv/)
 make install
 
-# Clone the ARC-AGI-2 dataset
+# Clone an ARC dataset
 git clone https://github.com/arcprize/ARC-AGI-2.git arc-agi-2
 ln -s arc-agi-2/data data
 
@@ -376,19 +357,15 @@ make lint
 # Run tests
 make test
 
-# Train on ARC-AGI-2 (quick debug run)
+# Quick debug run (fits a 16 GB laptop; 16x16 grid subset)
 make train
 
 # Full training (JSON dataset)
 uv run python train.py --data_root data --epochs 40
 
-# Train with augmented parquet dataset
-uv run python train.py --parquet_dir data/parquet --data_root data --epochs 40
-
-# Train with specific parquet files and gradient accumulation
-uv run python train.py \
-    --parquet_files data/parquet/seeds_original.parquet data/parquet/rearc.parquet \
-    --data_root data --batch_size 4 --grad_accum 32 --epochs 40
+# Train with augmented parquet dataset on a single GPU (e.g. A40):
+uv run python train.py --parquet_dir data/parquet --data_root data \
+    --batch_size 8 --grad_accum 32 --epochs 2 --amp --val_every 2000
 
 # Evaluate and generate visualisation plots
 uv run python evaluate.py --data_root data
@@ -397,74 +374,110 @@ uv run python evaluate.py --data_root data
 uv run python submit.py --challenges arc-agi_evaluation_challenges.json
 ```
 
-## ARC-AGI-2 Dataset
+### Hardware guidance
 
-The [ARC-AGI-2](https://github.com/arcprize/ARC-AGI-2) dataset contains:
+Attention cost is dominated by the demo context (up to
+`max_demos × 2 × H × W` keys), so the grid-size cap is the main knob:
 
-- **1,000 training tasks** — demonstrate the task format and Core Knowledge
-  priors.
-- **120 public evaluation tasks** — for testing models on unseen tasks.
+| Hardware | Suggested settings |
+|---|---|
+| **MacBook (M1/M2, 16 GB)** | `--max_grid_size 16 --batch_size 2 --num_workers 0` — trains on the small-grid subset; great for development and small-scale experiments |
+| **Single A40/A6000-class GPU (40–48 GB)** | full `--max_grid_size 30`, `--batch_size 8 --grad_accum 32 --amp` (bfloat16 autocast + fused SDPA attention) |
+
+Tasks with grids larger than `--max_grid_size` are **skipped, not
+truncated**, so a reduced canvas trains on a consistent subset (the
+loaders print how many tasks were filtered).
+
+### Training dynamics
+
+- **Per-step LR schedule**: linear warmup (default `min(2000, 3%)` of
+  total optimiser steps) then cosine annealing to 5% of the peak LR.
+  Per-epoch scheduling is useless when one epoch is hundreds of
+  thousands of steps.
+- **Mid-epoch validation**: `--val_every N` validates (and checkpoints)
+  every N optimiser steps — strongly recommended for million-sample
+  parquet datasets.
+- **Gradient accumulation**: `--grad_accum N` sets the effective batch
+  size.  Rule commits only happen on optimiser-step boundaries.
+- **Checkpoint selection**: best `(exact-match solve rate, cell
+  accuracy)` — cell accuracy alone is flattering (90% cells can still be
+  0% solved tasks).
+- The per-epoch log prints the four routing weights, per-pathway
+  auxiliary losses, the verification loss, and the number of rules
+  committed — watch `alpha(...)` to see the router's division of labour
+  emerge.
+
+## Data
+
+### JSON (ARC format)
+
+```
+data/
+    training/       # task JSON files
+    evaluation/     # task JSON files (always used for validation)
+```
 
 Each task is a JSON file with demonstration input/output pairs and test
-input(s).  Grids are rectangular matrices of integers 0–9 (up to 30×30).
-The goal is to produce the correct output grid by inferring the
-transformation rule from the demonstrations.
+input(s).
 
 ### Augmented Data (Parquet)
 
 The training script also supports loading augmented datasets stored as
 `.parquet` files (e.g. the
-[Giotto ARC-AGI dataset](https://zenodo.org/records/18508333) with ~1.2M
-synthetic tasks).  Each parquet file must have columns `id` (string) and
-`task` (JSON string in the standard ARC format).
+[Giotto ARC-AGI dataset](https://zenodo.org/records/18508333) or
+[re-ARC](https://github.com/michaelhodel/re-arc) exports).  Each parquet
+file must have columns `id` (string) and `task` (JSON string in the
+standard ARC format).
 
-```
-data/
-    evaluation/              # 120 JSON files (always needed for validation)
-    parquet/                 # augmented parquet files
-        seeds_original.parquet
-        rearc.parquet
-        ...
-```
+Use `--parquet_dir data/parquet/` to load all parquet files in a
+directory, or `--parquet_files file1.parquet file2.parquet` to select
+specific files.  Validation always reads from `data/evaluation/` (JSON).
 
-Use `--parquet_dir data/parquet/` to load all parquet files in a directory,
-or `--parquet_files file1.parquet file2.parquet` to select specific files.
-Validation always reads from `data/evaluation/` (JSON).
+The parquet loader is **lazy and worker-safe**: only a lightweight index
+is built at init; each DataLoader worker re-opens the files on first
+access (no multi-gigabyte tables are pickled to spawned workers), and
+JSON is parsed on-the-fly per sample.
 
-The parquet loader uses **lazy loading**: only a lightweight index is built
-at init (~20s for 1.2M tasks), and JSON is parsed on-the-fly per sample.
-RAM usage stays proportional to the compressed parquet size (~1.3 GB)
-rather than the fully materialised Python objects.
+### Recommended experiment: stratified rule generalisation
 
-### Training Dynamics
+The architecture makes a sharp, testable prediction: **RuleMemory should
+win on new instances of *seen* rules, while RuleGenerator/Guess should
+win on *unseen* rules** — with the router's α shifting accordingly.  To
+test it, don't train on the full augmented dump; stratify it:
 
-The training script includes:
+1. Sample N rule families × M instances from re-ARC (e.g. 100 × 500).
+2. Hold out (a) unseen instances of seen rules and (b) entire unseen
+   rule families.
+3. Compare solve rates and mean α per pathway on (a) vs (b), and check
+   slot specialisation in `rule_utility.png` / the retrieval head maps.
 
-- **LR warmup**: Linear warmup over the first `min(5, epochs // 4)` epochs
-  from `lr × 0.01` to `lr`, followed by cosine annealing.
-- **Gradient accumulation**: `--grad_accum N` sets the effective batch size
-  to `N`.  With `--batch_size 4 --grad_accum 32`, the model processes 4
-  samples at a time but accumulates gradients over 8 steps before updating.
-  `N` must be >= `batch_size` and divisible by it.
+This gives a direct readout of the fusion hypothesis at a fraction of
+the compute of training on millions of samples.
 
 ## Project Structure
 
 ```
 fusion_model/
-    __init__.py         # Package re-exports
-    model.py            # FusionModel orchestrator (grid encoder + cross-attention + fusion)
-    memory.py           # RuleMemory (low-rank rule bank + differentiable retrieval)
-    rule_engine.py      # RuleGenerator (ephemeral hypothesis proposer + history buffer)
-    guess.py            # GuessComponent (FiLM-conditioned local/global attention predictor)
-    decision.py         # DecisionRouter (cross-attention softmax mixture weights)
-    loss.py             # FusionLoss (task + 6 regularisation terms)
+    __init__.py         # Package re-exports (incl. PATHWAY_NAMES order)
+    common.py           # Shared helpers: masked pooling, per-sample CE
+    model.py            # FusionModel orchestrator (encoding, task embedding,
+                        #   cross-attention, verification, size head, fusion)
+    memory.py           # RuleMemory (low-rank rule bank + multi-head retrieval
+                        #   + strength dynamics + pruning)
+    rule_engine.py      # RuleGenerator (ephemeral rules) + RuleProposer
+                        #   (history buffer, proposal pathway, commit gating)
+    guess.py            # GuessComponent (FiLM + local/global attention)
+    decision.py         # DecisionRouter (4-way, verification-grounded)
+    loss.py             # FusionLoss (task + size + verification + 6 regularisers)
 tasks/
-    arc.py              # ARC-AGI-2 dataset loaders (JSON + Parquet) and grid utilities
+    arc.py              # Dataset loaders (JSON + lazy parquet), grid utilities,
+                        #   size filtering
 tests/
-    test_components.py  # Unit tests for all model components
-train.py                # Training loop (AdamW + warmup + cosine LR + grad accumulation)
+    test_components.py  # Unit + regression tests for all components
+train.py                # Training loop (AdamW, per-step warmup/cosine, AMP,
+                        #   grad accumulation, outcome feedback, solve-rate val)
 evaluate.py             # Evaluation + matplotlib visualisations
-submit.py               # Kaggle submission.json generator
+submit.py               # Kaggle submission generator (two-pass size inference)
 pyproject.toml          # UV project config (deps, ruff, mypy, pytest)
 Makefile                # Unix make targets
 Make.ps1                # PowerShell equivalent
