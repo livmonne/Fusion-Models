@@ -3,23 +3,28 @@
 **High-level idea:**  Instead of modifying the base network's weights to
 encode every pattern, we store a set of small *corrections* ("rules") in a
 memory bank.  At inference time the model looks up which rules are relevant
-to the current input and blends their corrections together.
+to the current task and blends their corrections together.
 
-Each *rule slot* stores three things:
+Each *rule slot* stores:
 
 1. **key** — a trigger embedding that determines *when* the rule fires.
-   **Multi-head cross-attention** between the pooled input embedding and
-   every key allows different heads to specialise on different aspects of
-   relevance (e.g. spatial layout vs colour transformation).
+   **Multi-head cross-attention** between the pooled **task embedding**
+   ``t`` (derived from the demo pairs, *not* the test input — the rule
+   lives in the demonstrations) and every key allows different heads to
+   specialise on different aspects of relevance (e.g. spatial layout vs
+   colour transformation).
 2. **A, B** — a pair of small matrices whose product ``A @ (B @ x)`` forms a
    low-rank correction to the per-token embeddings.  This is the same idea
    as LoRA (Hu et al., 2021): rather than storing a full weight matrix we
-   only store two thin factors, keeping memory usage small.  During the
-   forward pass, retrieval scores are folded into the A/B matrices *before*
-   expanding over the spatial dimension, so peak memory is ``O(B × seq × E)``
-   instead of the naïve ``O(B × seq × S × E)``.
-3. **head** — a tiny linear projection that converts the correction into
-   per-cell colour logits.
+   only store two thin factors, keeping memory usage small.
+
+The score-weighted blend of slot corrections is added back onto the token
+stream (``x + blended``) — exactly like LoRA's base path — and decoded by a
+**shared** classification head.  Earlier revisions decoded each slot's
+correction in isolation, which forced every per-cell prediction through a
+rank-``r`` bottleneck; the residual base path removes that bottleneck and
+also avoids materialising a ``(batch, seq, slots, embed)`` tensor, keeping
+peak memory low enough for laptop-class GPUs.
 
 Retrieval uses **multi-head** scaled-dot-product cross-attention so that
 gradients flow through the memory bank and the whole system is end-to-end
@@ -33,35 +38,39 @@ influence during retrieval — weak memories contribute less, strong ones
 dominate.  Strength is derived from two independent signals:
 
 - **Frequency** — how often the slot is activated (cumulative retrieval
-  score, normalised to ``[0, 1]``).  Frequently triggered memories build
-  up a high frequency score.
-- **Recency** — how recently the slot was last strongly activated.  A
-  per-slot step counter tracks the last activation time, and a learnable
-  recency half-life controls how quickly the recency signal decays.
+  score, normalised to ``[0, 1]``).
+- **Recency** — how recently the slot was last strongly activated, with a
+  learnable half-life.
 
-The final strength is ``frequency_score * recency_score``.  Both the
-**decay rate** (which governs how fast frequency fades each step) and the
-**reinforcement rate** (which governs how much a retrieval boosts
-frequency) are *learnable parameters* — the model can discover its own
-optimal forgetting/consolidation dynamics via gradient descent.  During
-each forward pass the new frequency is computed *differentiably* from
-the current rate parameters and used in the strength gating, providing
+The final strength is ``frequency_score * recency_score``.  The **decay
+rate** and **reinforcement rate** are *learnable parameters*; their
+initial values are derived from the slot count so that an average slot
+(softmax scores sum to 1, so the mean score is ``1/num_slots``) settles at
+an equilibrium frequency of ~0.5 instead of hovering at the prune
+threshold.  Similarly, the recency-activation threshold is *relative* to
+the uniform score ``1/num_slots`` rather than a fixed constant.  Earlier
+fixed defaults were tuned for ~16 slots and caused permanent prune/respawn
+churn at 64+ slots.
+
+During each forward pass the new frequency is computed *differentiably*
+from the current rate parameters and used in the strength gating, providing
 the gradient path ``loss → scores → strength → new_freq → rate logits``.
-The resulting frequency value is then detached and stored in a buffer
-for the next step.
+The resulting frequency value is then detached and stored in a buffer for
+the next step.
 
 Slots whose strength falls below a configurable threshold are considered
-"forgotten" and are recycled: their parameters are re-initialised with
-small random values and given a moderate starting strength, making room
-for newly proposed rules.
+"forgotten" and recycled: their parameters are re-initialised with small
+random values (``B`` reset to zero so the recycled slot starts as a no-op)
+and given a moderate starting strength.  Pruning is deliberately
+infrequent (every 500 steps by default) because it resets parameters that
+the optimiser still holds momentum for.
 
-The module also maintains a running *utility* estimate (exponential moving
-average of each slot's mean retrieval score).  Low-utility slots are
-recycled by the :class:`~fusion_model.rule_engine.RuleGenerator` commitment
-mechanism: when the generator proposes a rule, it is **soft-blended** into
-the lowest-utility slot via :meth:`commit_rule` using a learned commit
-weight, giving the bank a warm start for newly discovered patterns while
-preserving existing slot content proportionally.
+Rules proposed by the :class:`~fusion_model.rule_engine.RuleGenerator` are
+**soft-blended** into the weakest slot via :meth:`commit_rule`.  Commits
+are invoked by the *training loop* after the backward pass (see
+``FusionModel.apply_outcomes``) — never mid-step — so the in-place
+parameter update can no longer corrupt gradients computed in the same
+forward pass.
 """
 
 from __future__ import annotations
@@ -72,13 +81,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .common import masked_mean
+
 
 class MultiHeadMemoryCrossAttention(nn.Module):
     """Multi-head cross-attention for memory slot retrieval.
 
     This module replaces a simple single-head dot-product between the pooled
-    task embedding ``h`` and the memory slot keys.  Instead, it projects both
-    the query (``h``) and the keys/values (slot key bank) into multiple
+    task embedding ``t`` and the memory slot keys.  Instead, it projects both
+    the query (``t``) and the keys/values (slot key bank) into multiple
     independent subspaces ("heads"), computes scaled-dot-product attention in
     each subspace, and combines the results.
 
@@ -101,26 +112,6 @@ class MultiHeadMemoryCrossAttention(nn.Module):
     3. ``head_attn (batch, num_heads, num_slots)`` — raw per-head attention
        maps, useful for visualisation and debugging.
 
-    **Architecture (per forward call):**
-
-    ::
-
-        h (B, E)       ──► q_proj ──► Q (B, H, D)  ─┐
-                                                      ├─► attn_logits (B, H, S)
-        keys (S, E)    ──► k_proj ──► K (S, H, D)  ─┘     │
-                       ──► v_proj ──► V (S, H, D)         │
-                                                      softmax
-                                                           │
-                                                    head_attn (B, H, S)
-                                                      │         │
-                                              einsum w/ V    einsum w/ head_combine
-                                                      │         │
-                                              retrieved (B,H,D)  scores (B, S)
-                                                      │
-                                              reshape → out_proj
-                                                      │
-                                              context (B, E)
-
     :param embed_dim: Embedding dimensionality.  Must be divisible by
         ``num_heads`` so that each head operates on a ``head_dim``-sized
         subspace.
@@ -142,8 +133,7 @@ class MultiHeadMemoryCrossAttention(nn.Module):
 
         # Linear projections that map the query and keys/values into
         # multi-head subspaces.  No bias — following standard practice
-        # for attention Q/K/V projections (bias can shift attention in
-        # undesirable ways and adds no expressivity here).
+        # for attention Q/K/V projections.
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -154,18 +144,17 @@ class MultiHeadMemoryCrossAttention(nn.Module):
 
         # Learned head-combination weights.  Initialised to uniform
         # (all ones → softmax gives 1/H each) so that early training
-        # uses all heads equally.  The model can later learn to
-        # up-weight the most informative heads.
+        # uses all heads equally.
         self.head_combine = nn.Parameter(torch.ones(num_heads))
 
     def forward(
-        self, h: torch.Tensor, keys: torch.Tensor,
+        self, t: torch.Tensor, keys: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute multi-head cross-attention over the memory slot bank.
 
-        :param h: Pooled task embedding of shape ``(batch, embed_dim)``.
+        :param t: Pooled task embedding of shape ``(batch, embed_dim)``.
             This serves as the *query* — "what kind of rules does the
-            current input need?"
+            current task need?"
         :param keys: Memory slot key bank of shape ``(num_slots, embed_dim)``.
             Each row is a learnable trigger embedding.  These serve as
             both *keys* (for matching) and *values* (for retrieval
@@ -173,55 +162,36 @@ class MultiHeadMemoryCrossAttention(nn.Module):
         :return: A 3-tuple ``(scores, context, head_attn)``:
 
             - **scores** ``(batch, num_slots)`` — combined retrieval
-              weights that sum to 1 over the slot dimension.  These
-              replace the old single-head softmax scores.
-            - **context** ``(batch, embed_dim)`` — a rich retrieved
-              representation formed by the standard multi-head attention
-              output (weighted sum of value projections, concatenated
-              across heads, then linearly projected).  This is added to
-              the memory pathway's router representation so the decision
-              router gets a richer signal.
-            - **head_attn** ``(batch, num_heads, num_slots)`` — the raw
-              per-head softmax attention distributions.  Logged in the
-              training metadata for visualisation and analysis (e.g.
-              checking whether heads have specialised).
+              weights that sum to 1 over the slot dimension.
+            - **context** ``(batch, embed_dim)`` — the standard multi-head
+              attention output (weighted sum of value projections), added
+              to the memory pathway's router representation.
+            - **head_attn** ``(batch, num_heads, num_slots)`` — raw
+              per-head softmax attention distributions, logged for
+              visualisation (e.g. checking whether heads specialised).
         """
-        B = h.shape[0]
+        B = t.shape[0]
         S = keys.shape[0]
         H = self.num_heads
         D = self.head_dim
 
         # ── Project into multi-head subspaces ──────────────────────────
-        # Each projection: (*, embed_dim) → (*, embed_dim), then reshaped
-        # into (*, num_heads, head_dim).
-        Q = self.q_proj(h).view(B, H, D)      # (B, H, D)
+        Q = self.q_proj(t).view(B, H, D)       # (B, H, D)
         K = self.k_proj(keys).view(S, H, D)    # (S, H, D)
         V = self.v_proj(keys).view(S, H, D)    # (S, H, D)
 
         # ── Scaled dot-product attention per head ──────────────────────
-        # attn_logits[b, h, s] = (Q[b,h,:] · K[s,h,:]) / √D
-        # Scaling by √head_dim prevents the dot products from growing
-        # too large in magnitude, which would push softmax into
-        # saturated regions with vanishing gradients.
         attn_logits = torch.einsum("bhd,shd->bhs", Q, K) / (D ** 0.5)
         head_attn = F.softmax(attn_logits, dim=-1)  # (B, H, S)
 
         # ── Retrieve values via attention-weighted sum ─────────────────
-        # For each head, compute a weighted sum of value vectors across
-        # all slots: retrieved[b, h, d] = Σ_s head_attn[b,h,s] · V[s,h,d]
         retrieved = torch.einsum("bhs,shd->bhd", head_attn, V)  # (B, H, D)
-
-        # Concatenate heads back into full embed_dim and project.
-        retrieved = retrieved.reshape(B, self.embed_dim)    # (B, E)
-        context = self.out_proj(retrieved)                   # (B, E)
+        retrieved = retrieved.reshape(B, self.embed_dim)        # (B, E)
+        context = self.out_proj(retrieved)                      # (B, E)
 
         # ── Combine per-head attention into final slot scores ──────────
-        # head_w: (H,) — learned softmax weights over heads.
-        # scores[b, s] = Σ_h head_w[h] · head_attn[b, h, s]
-        # This produces a single attention distribution over slots that
-        # is a convex combination of all heads' distributions.
-        head_w = F.softmax(self.head_combine, dim=0)           # (H,)
-        scores = torch.einsum("bhs,h->bs", head_attn, head_w)  # (B, S)
+        head_w = F.softmax(self.head_combine, dim=0)            # (H,)
+        scores = torch.einsum("bhs,h->bs", head_attn, head_w)   # (B, S)
 
         return scores, context, head_attn
 
@@ -230,39 +200,43 @@ class RuleMemory(nn.Module):
     """Fixed-size bank of learnable low-rank rule slots with biologically-inspired
     memory strength dynamics.
 
-    Now operates on **per-token spatial embeddings** rather than a single
-    pooled vector.  Retrieval scores are computed from the pooled embedding
-    ``h`` via **multi-head cross-attention** over the slot key bank (one
-    combined score vector per sample), while the low-rank corrections and
-    classification heads are applied independently to every spatial token.
+    Operates on **per-token spatial embeddings**: retrieval scores are
+    computed once per sample from the pooled task embedding ``t`` via
+    multi-head cross-attention over the slot key bank, while the low-rank
+    corrections are applied independently to every spatial token.  The
+    score-blended correction is added onto the token stream (``x +
+    blended``) and decoded by a shared classification head — the LoRA-style
+    base path.
 
     :param embed_dim: Dimensionality of the shared input embedding.
     :param num_colours: Number of per-cell colour classes (10 for ARC).
     :param num_slots: How many rule slots to allocate.
     :param rank: Inner rank of each rule's low-rank decomposition ``A @ (B @ x)``.
     :param num_retrieval_heads: Number of attention heads for multi-head
-        memory retrieval.  Each head independently assesses slot relevance;
-        a learned combination merges them into the final per-slot scores.
-        Must evenly divide ``embed_dim``.
+        memory retrieval.  Must evenly divide ``embed_dim``.
     :param prune_threshold: Strength below which a slot is considered
         "forgotten" and eligible for recycling.
-    :param prune_every_n_steps: How often (in forward passes) to run the
-        pruning sweep.  Set to 0 to disable automatic pruning.
-    :param recency_activation_threshold: Minimum batch-mean retrieval score
-        for a slot to count as "recently activated" (resets its recency
-        timer).
+    :param prune_every_n_steps: How often (in training forward passes) to
+        run the pruning sweep.  Set to 0 to disable automatic pruning.
+        Kept deliberately large: pruning re-initialises parameters the
+        optimiser still has momentum for, so frequent pruning causes churn.
+    :param recency_rel_threshold: A slot counts as "recently activated"
+        (resetting its recency timer) when its batch-mean retrieval score
+        exceeds ``recency_rel_threshold / num_slots`` — i.e. this many
+        times the uniform share.  Relative scaling keeps the dynamics
+        sensible across slot counts.
     """
 
     def __init__(
         self,
         embed_dim: int = 256,
         num_colours: int = 10,
-        num_slots: int = 16,
+        num_slots: int = 64,
         rank: int = 16,
         num_retrieval_heads: int = 4,
         prune_threshold: float = 0.05,
-        prune_every_n_steps: int = 100,
-        recency_activation_threshold: float = 0.1,
+        prune_every_n_steps: int = 500,
+        recency_rel_threshold: float = 2.0,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -272,34 +246,33 @@ class RuleMemory(nn.Module):
         self.num_retrieval_heads = num_retrieval_heads
         self.prune_threshold = prune_threshold
         self.prune_every_n_steps = prune_every_n_steps
-        self.recency_activation_threshold = recency_activation_threshold
+        # Absolute activation threshold derived from the uniform score.
+        self.recency_activation_threshold = recency_rel_threshold / num_slots
 
         # --- Learnable rule bank ---
-        # Each slot's key is a trigger embedding.  The multi-head cross-
-        # attention module projects these through learned K and V
-        # transforms, decoupling "what triggers retrieval" from "what
-        # information is retrieved."
         self.keys = nn.Parameter(torch.randn(num_slots, embed_dim) * 0.02)
 
-        # Low-rank factors: correction = A @ (B @ x_token).
+        # Low-rank factors: correction = A @ (B @ x_token).  B starts at
+        # zero so every slot begins as a no-op correction (standard LoRA
+        # initialisation).
         self.B = nn.Parameter(torch.zeros(num_slots, rank, embed_dim))
         self.A = nn.Parameter(torch.randn(num_slots, embed_dim, rank) * 0.02)
 
-        # Per-slot classification head: maps embed_dim → num_colours.
-        self.heads = nn.Linear(embed_dim, num_colours * num_slots, bias=False)
+        # Shared classification head reading the residual stream
+        # (x + blended correction).  A LayerNorm keeps the residual sum
+        # well-scaled regardless of how large the corrections grow.
+        self.head_norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_colours)
 
         # ── Multi-head cross-attention for retrieval ─────────────────────
-        # Replaces the old single-head dot-product (h @ keys.T / √d).
-        # Each of the `num_retrieval_heads` heads independently assesses
-        # which slots are relevant, then a learned combination merges them.
         self.retrieval_attn = MultiHeadMemoryCrossAttention(
             embed_dim=embed_dim,
             num_heads=num_retrieval_heads,
         )
 
-        # LayerNorm stabilises the residual sum of the mean-pooled
-        # blended correction and the cross-attention context vector
-        # before it's fed to the decision router.
+        # LayerNorm stabilises the residual sum of the pooled blended
+        # correction and the cross-attention context vector before it's
+        # fed to the decision router.
         self.repr_norm = nn.LayerNorm(embed_dim)
 
         # Running utility score per slot (not trained — purely diagnostic).
@@ -307,8 +280,18 @@ class RuleMemory(nn.Module):
         self.register_buffer("utility", torch.zeros(num_slots))
 
         # ── Memory strength: frequency + recency ─────────────────────────
-        self.decay_rate_logit = nn.Parameter(torch.tensor(math.log(0.999 / 0.001)))
-        self.reinforce_rate_logit = nn.Parameter(torch.tensor(math.log(0.01 / 0.99)))
+        # Initial rates are derived from the slot count: with softmax
+        # scores the mean per-slot score is 1/num_slots, so equilibrium
+        # frequency = reinforce * mean_score / (1 - decay).  We pick the
+        # reinforcement rate so an average slot equilibrates at ~0.5.
+        decay_init = 0.999
+        reinforce_init = min(0.5, max(1e-3, 0.5 * (1.0 - decay_init) * num_slots))
+        self.decay_rate_logit = nn.Parameter(
+            torch.tensor(math.log(decay_init / (1.0 - decay_init)))
+        )
+        self.reinforce_rate_logit = nn.Parameter(
+            torch.tensor(math.log(reinforce_init / (1.0 - reinforce_init)))
+        )
         self.recency_halflife_log = nn.Parameter(torch.tensor(math.log(500.0)))
 
         self.frequency: torch.Tensor
@@ -343,33 +326,35 @@ class RuleMemory(nn.Module):
     # ── Forward pass ──────────────────────────────────────────────────────
 
     def forward(
-        self, x: torch.Tensor, h: torch.Tensor
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        pad_mask: torch.Tensor | None = None,
+        update_state: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Retrieve relevant rules and produce per-cell memory-pathway logits.
 
         :param x: Spatial token embeddings ``(batch, seq, embed_dim)``.
-        :param h: Pooled embedding ``(batch, embed_dim)`` used for retrieval
-            key matching.
+        :param t: Pooled task embedding ``(batch, embed_dim)`` used as the
+            retrieval query.
+        :param pad_mask: Boolean validity mask ``(batch, seq)``; True for
+            real cells.  Used for the pooled router representation.
+        :param update_state: Whether to update the frequency/recency
+            buffers (training only).  The demo-verification pass sets this
+            to False so each optimiser step counts as exactly one memory
+            step.
         :return: Tuple of ``(logits_mem, mem_repr, retrieval_info)`` where
             ``logits_mem`` has shape ``(batch, seq, num_colours)``,
             ``mem_repr`` is a pooled representation ``(batch, embed_dim)``
-            for the router, and ``retrieval_info`` is a dict with
-            ``scores`` and ``strength``.
+            for the router, and ``retrieval_info`` carries ``scores``,
+            ``strength``, and ``head_attn``.
         """
-        # -- 1. Multi-head cross-attention retrieval from pooled h --
-        # The cross-attention module projects h (query) and self.keys
-        # (key/value) into multiple head subspaces, computes per-head
-        # softmax attention, and merges them via a learned combination.
-        # Returns:
-        #   raw_scores  (B, S) — combined retrieval weights
-        #   mem_context (B, E) — retrieved memory context vector
-        #   head_attn   (B, H, S) — per-head attention maps
-        raw_scores, mem_context, head_attn = self.retrieval_attn(h, self.keys)
+        # -- 1. Multi-head cross-attention retrieval from pooled t --
+        raw_scores, mem_context, head_attn = self.retrieval_attn(t, self.keys)
 
         # -- 2. Compute differentiable frequency & gate by memory strength --
-        # During training, compute new_freq through the learnable decay/reinforce
-        # rate parameters so that gradients flow back to them.
-        if self.training:
+        track = self.training and update_state
+        if track:
             batch_mean_scores = raw_scores.detach().mean(dim=0)  # (S,)
             decay_rate = torch.sigmoid(self.decay_rate_logit)
             reinforce_rate = torch.sigmoid(self.reinforce_rate_logit)
@@ -384,46 +369,25 @@ class RuleMemory(nn.Module):
         gated_scores = raw_scores * strength.unsqueeze(0)
         scores = gated_scores / (gated_scores.sum(dim=-1, keepdim=True) + 1e-8)  # (B, S)
 
-        # -- 3–5. Per-token low-rank corrections, blending, and classification --
-        #
-        # The naïve approach materialises a (B, seq, S, E) correction
-        # tensor — with S=128, seq=900, E=256 this is ~471 MB per
-        # micro-batch in float32.  Instead we contract scores into the
-        # computation *before* expanding over the spatial dimension,
-        # producing intermediates of at most (B, seq, E) or (S, R, E).
-        #
-        # Key identity: blended(b,t,e) = Σ_s scores(b,s) · A(s,e,r) · B(s,r,e') · x(b,t,e')
-        #   = Σ_s A(s,e,r) · [ scores(b,s) · B(s,r,e') · x(b,t,e') ]
-        #
-        # Step 1: score-weighted B per sample → wB(b, r, e) = Σ_s scores(b,s) · B(s,r,e)
-        wB = torch.einsum("bs, sre -> bre", scores, self.B)  # (B, R, E)
-        # Step 2: compressed(b, r, t) = wB(b, r, e) · x(b, t, e)^T
-        compressed = torch.bmm(wB, x.transpose(1, 2))  # (B, R, T)
-        # Step 3: score-weighted A → wA(b, e, r) = Σ_s scores(b,s) · A(s,e,r)
-        wA = torch.einsum("bs, ser -> ber", scores, self.A)  # (B, E, R)
-        # Step 4: blended(b, t, e) = (wA @ compressed)^T
-        blended = torch.bmm(wA, compressed).transpose(1, 2)  # (B, T, E)
+        # -- 3. Score-blended low-rank correction --
+        # compressed(b, t, s, r) = B(s, r, e) · x(b, t, e) — the rank-r
+        # bottleneck per slot.  Scaling by the retrieval scores *before*
+        # contracting with A avoids materialising the much larger
+        # (batch, seq, slots, embed) per-slot correction tensor.
+        compressed = torch.einsum("sre, bte -> btsr", self.B, x)
+        weighted = compressed * scores.unsqueeze(1).unsqueeze(-1)  # (B, T, S, r)
+        blended = torch.einsum("ser, btsr -> bte", self.A, weighted)  # (B, T, E)
 
-        # Classification: similarly fold scores into the per-slot heads
-        # before the spatial expansion.
-        # w_heads: (S, C, E)  →  wH(b, c, e) = Σ_s scores(b,s) · W(s,c,e)
-        w_heads = self.heads.weight.view(self.num_slots, self.num_colours, self.embed_dim)
-        wH = torch.einsum("bs, sce -> bce", scores, w_heads)  # (B, C, E)
-        # logits_mem(b, t, c) = blended(b, t, e) · wH(b, c, e)
-        logits_mem = torch.einsum("bte, bce -> btc", blended, wH)  # (B, T, C)
+        # -- 4. Decode from the residual stream (base path + correction) --
+        logits_mem = self.head(self.head_norm(x + blended))  # (B, T, C)
 
-        # -- 6. Router representation --
-        # Combine two complementary signals for the decision router:
-        #   (a) Mean-pooled blended correction — the actual per-token
-        #       effect of the selected rules, averaged over positions.
-        #   (b) mem_context — a summary of *which* slots were selected
-        #       and their value projections, from the cross-attention.
-        # The residual sum is stabilised by LayerNorm before being
-        # passed to the router.
-        mem_repr = self.repr_norm(blended.mean(dim=1) + mem_context)  # (B, E)
+        # -- 5. Router representation --
+        # (a) masked mean of the blended correction — what the rules did;
+        # (b) mem_context — which slots were selected (attention output).
+        mem_repr = self.repr_norm(masked_mean(blended, pad_mask) + mem_context)
 
-        # -- 7. Persist frequency state & update recency (training only) --
-        if self.training:
+        # -- 6. Persist frequency state & update recency (training only) --
+        if track:
             with torch.no_grad():
                 self.frequency.copy_(new_freq.detach())
 
@@ -443,8 +407,6 @@ class RuleMemory(nn.Module):
         retrieval_info: dict[str, torch.Tensor] = {
             "scores": scores,
             "strength": strength,
-            # Per-head attention maps (B, H, S) for visualisation /
-            # analysis — lets you inspect whether heads have specialised.
             "head_attn": head_attn,
         }
         return logits_mem, mem_repr, retrieval_info
@@ -470,6 +432,11 @@ class RuleMemory(nn.Module):
     ) -> None:
         """Soft-blend a proposed rule into a slot.
 
+        Must only be called *between* optimiser steps (the training loop
+        does this via ``FusionModel.apply_outcomes``) — never between a
+        forward and backward pass, where the in-place update would corrupt
+        the gradients of the affected slot.
+
         :param slot_idx: Target slot index in ``[0, num_slots)``.
         :param key: Trigger embedding ``(embed_dim,)``.
         :param A: Low-rank factor ``(embed_dim, rank)``.
@@ -490,6 +457,10 @@ class RuleMemory(nn.Module):
     @torch.no_grad()
     def prune_weak_slots(self, threshold: float | None = None) -> int:
         """Recycle slots whose strength has decayed below *threshold*.
+
+        Recycled slots get a fresh random key, a small random ``A``, and a
+        **zero** ``B`` so they restart as no-op corrections (matching the
+        initial LoRA-style state).
 
         :param threshold: Override for ``self.prune_threshold``.
         :return: Number of slots that were pruned.

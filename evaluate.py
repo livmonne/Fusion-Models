@@ -1,9 +1,11 @@
-"""Evaluation and visualisation for the Fusion Model on ARC-AGI-2.
+"""Evaluation and visualisation for the Fusion Model.
 
 Run this after ``train.py`` to generate:
 
-1. **Accuracy summary** — overall per-cell accuracy and per-task solve rate.
-2. **Router behaviour** — mean routing weights across tasks.
+1. **Accuracy summary** — per-cell accuracy, output-size accuracy, and the
+   honest exact-match solve rate (predicted size must match *and* every
+   cell must be correct — no oracle output size).
+2. **Router behaviour** — mean routing weights across the four pathways.
 3. **Training curves** — loss and accuracy over epochs.
 4. **Rule utility histogram** — memory slot utilisation.
 5. **Grid visualisation** — side-by-side input / predicted / ground-truth
@@ -23,8 +25,8 @@ import torch
 from matplotlib.colors import ListedColormap
 from torch.utils.data import DataLoader
 
-from fusion_model import FusionModel
-from tasks.arc import NUM_COLOURS, PAD_VALUE, ARCDataset, arc_collate_fn
+from fusion_model import PATHWAY_NAMES, FusionModel
+from tasks.arc import NUM_COLOURS, ARCDataset, arc_collate_fn
 
 matplotlib.use("Agg")
 
@@ -51,16 +53,28 @@ def gather_predictions(
     model: FusionModel,
     loader: DataLoader,  # type: ignore[type-arg]
     device: torch.device,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray]:
-    """Run inference and collect per-sample predictions.
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray, dict[str, float]]:
+    """Run inference and collect per-sample predictions and metrics.
 
-    :return: Tuple of ``(pred_grids, target_grids, input_grids, alphas)``
-        where grids are lists of 2-D arrays and alphas is ``(N, 3)``.
+    Predicted grids are cropped to the model's **predicted** output size;
+    the solve rate therefore requires the size head to be right as well as
+    every cell.  Per-cell accuracy is computed against the oracle output
+    size as a smoother diagnostic.
+
+    :return: Tuple of ``(pred_grids, target_grids, input_grids, alphas,
+        metrics)`` where grids are lists of 2-D arrays, alphas is
+        ``(N, NUM_PATHWAYS)``, and metrics holds ``cell_acc``,
+        ``solve_rate``, and ``size_acc``.
     """
     all_preds: list[np.ndarray] = []
     all_targets: list[np.ndarray] = []
     all_inputs: list[np.ndarray] = []
     all_alphas: list[torch.Tensor] = []
+    cell_correct = 0
+    cell_total = 0
+    solved = 0
+    size_correct = 0
+    n_samples = 0
     model.eval()
 
     with torch.no_grad():
@@ -73,8 +87,9 @@ def gather_predictions(
             output_size = batch["output_size"]
             input_size = batch["input_size"]
 
-            logits, alphas, _ = model(demo_inputs, demo_outputs, demo_mask, test_input)
+            logits, alphas, meta = model(demo_inputs, demo_outputs, demo_mask, test_input)
             preds = logits.argmax(dim=-1).cpu()  # (B, max_cells)
+            size_pred = (meta["size_logits"].argmax(dim=-1) + 1).cpu()  # (B, 2)
             all_alphas.append(alphas.cpu())
 
             B = test_input.size(0)
@@ -82,43 +97,58 @@ def gather_predictions(
             for i in range(B):
                 oh, ow = output_size[i].tolist()
                 ih, iw = input_size[i].tolist()
+                ph, pw = size_pred[i].tolist()
+                # Cap the predicted crop to the available canvas.
+                ph_c, pw_c = min(ph, H), min(pw, W)
 
-                pred_grid = preds[i].view(H, W)[:oh, :ow].numpy() if oh > 0 and ow > 0 else np.zeros((1, 1), dtype=int)
-                tgt_grid = test_output[i][:oh, :ow].numpy() if oh > 0 and ow > 0 else np.zeros((1, 1), dtype=int)
+                canvas = preds[i].view(H, W)
+                pred_grid = canvas[:ph_c, :pw_c].numpy()
+                tgt_grid = (
+                    test_output[i][:oh, :ow].numpy()
+                    if oh > 0 and ow > 0
+                    else np.zeros((1, 1), dtype=int)
+                )
                 inp_grid = test_input[i].cpu()[:ih, :iw].numpy()
 
                 all_preds.append(pred_grid)
                 all_targets.append(tgt_grid)
                 all_inputs.append(inp_grid)
 
+                if oh > 0 and ow > 0:
+                    n_samples += 1
+                    # Cell accuracy: oracle-size crop (diagnostic).
+                    oracle = canvas[:oh, :ow].numpy()
+                    mask = tgt_grid >= 0
+                    cell_correct += int((oracle[mask] == tgt_grid[mask]).sum())
+                    cell_total += int(mask.sum())
+                    # Honest solve: predicted size and all cells correct.
+                    if (ph, pw) == (oh, ow):
+                        size_correct += 1
+                        if pred_grid.shape == tgt_grid.shape and np.array_equal(
+                            pred_grid, tgt_grid
+                        ):
+                            solved += 1
+
     alphas_arr: np.ndarray = torch.cat(all_alphas).numpy()
-    return all_preds, all_targets, all_inputs, alphas_arr
+    metrics = {
+        "cell_acc": cell_correct / cell_total if cell_total else 0.0,
+        "solve_rate": solved / n_samples if n_samples else 0.0,
+        "size_acc": size_correct / n_samples if n_samples else 0.0,
+    }
+    return all_preds, all_targets, all_inputs, alphas_arr, metrics
 
 
 # ── Visualisations ──────────────────────────────────────────────────────────
 
 
-def print_accuracy_summary(
-    preds: list[np.ndarray], targets: list[np.ndarray]
-) -> None:
-    """Print per-cell accuracy and task solve rate."""
-    total_correct = 0
-    total_cells = 0
-    tasks_solved = 0
-
-    for pred, tgt in zip(preds, targets, strict=True):
-        mask = tgt >= 0
-        correct = (pred[mask] == tgt[mask]).sum()
-        cells = mask.sum()
-        total_correct += correct
-        total_cells += cells
-        if correct == cells and cells > 0:
-            tasks_solved += 1
-
-    cell_acc = total_correct / total_cells if total_cells > 0 else 0.0
-    solve_rate = tasks_solved / len(preds) if preds else 0.0
-    print(f"\nPer-cell accuracy: {cell_acc:.4f}")
-    print(f"Task solve rate:   {solve_rate:.4f} ({tasks_solved}/{len(preds)})")
+def print_accuracy_summary(metrics: dict[str, float], n: int) -> None:
+    """Print per-cell accuracy, size accuracy, and exact-match solve rate."""
+    print(f"\nPer-cell accuracy (oracle size): {metrics['cell_acc']:.4f}")
+    print(f"Output-size accuracy:            {metrics['size_acc']:.4f}")
+    print(
+        f"Exact-match solve rate:          {metrics['solve_rate']:.4f} "
+        f"(predicted size, {n} test pairs)"
+    )
 
 
 def plot_grid(
@@ -159,14 +189,15 @@ def plot_sample_grids(
 
 
 def plot_router_summary(alphas: np.ndarray, out_dir: str) -> None:
-    """Bar chart of mean routing weights."""
+    """Bar chart of mean routing weights over the four pathways."""
     means = alphas.mean(axis=0)
-    labels = [r"$\alpha_{mem}$", r"$\alpha_{rule}$", r"$\alpha_{guess}$"]
+    labels = [rf"$\alpha_{{{name}}}$" for name in PATHWAY_NAMES]
+    colours = ["#0074D9", "#FF4136", "#FF851B", "#2ECC40"]
 
-    fig, ax = plt.subplots(figsize=(5, 3))
-    ax.bar(labels, means, color=["#0074D9", "#FF4136", "#2ECC40"])
+    fig, ax = plt.subplots(figsize=(5.5, 3))
+    ax.bar(labels, means, color=colours[: len(labels)])
     ax.set_ylabel("Mean routing weight")
-    ax.set_title("Router Behaviour (ARC-AGI-2)")
+    ax.set_title("Router Behaviour")
     ax.set_ylim(0, 1)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "router_summary.png"), dpi=150)
@@ -186,10 +217,12 @@ def plot_training_curves(out_dir: str) -> None:
     axes[0].set_ylabel("Training Loss")
     axes[0].set_title("Training Loss")
 
-    axes[1].plot(hist["train_acc"], label="train")
-    axes[1].plot(hist["val_acc"], label="val")
+    axes[1].plot(hist["train_acc"], label="train (cells)")
+    axes[1].plot(hist["val_acc"], label="val (cells)")
+    if "val_solve" in hist:
+        axes[1].plot(hist["val_solve"], label="val (solve)")
     axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Per-Cell Accuracy")
+    axes[1].set_ylabel("Accuracy")
     axes[1].set_title("Accuracy")
     axes[1].legend()
 
@@ -220,7 +253,7 @@ def plot_rule_utility(model: FusionModel, out_dir: str) -> None:
 
 def main() -> None:
     """Load the best model, run evaluation, and generate all plots."""
-    parser = argparse.ArgumentParser(description="Evaluate Fusion Model on ARC-AGI-2")
+    parser = argparse.ArgumentParser(description="Evaluate the Fusion Model")
     parser.add_argument("--data_root", type=str, default="data")
     parser.add_argument("--out_dir", type=str, default="outputs")
     parser.add_argument("--batch_size", type=int, default=4)
@@ -228,6 +261,7 @@ def main() -> None:
     parser.add_argument("--max_grid_size", type=int, default=30)
     parser.add_argument("--max_demos", type=int, default=5)
     parser.add_argument("--embed_dim", type=int, default=256)
+    parser.add_argument("--num_rule_slots", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
 
@@ -253,6 +287,7 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=arc_collate_fn,
+        pin_memory=True,
     )
 
     # ── Load trained model ───────────────────────────────────────────────
@@ -260,22 +295,21 @@ def main() -> None:
         embed_dim=args.embed_dim,
         num_colours=NUM_COLOURS,
         max_grid_size=args.max_grid_size,
+        num_rule_slots=args.num_rule_slots,
+        max_demos=max(args.max_demos, 1),
     ).to(device)
     ckpt_path = os.path.join(args.out_dir, "fusion_best.pt")
     state = torch.load(ckpt_path, weights_only=True, map_location=device)
-    # Compatibility: old checkpoints have pos_encoding as (G*G, E) instead of (G, G, E).
-    pe = state.get("pos_encoding")
-    if pe is not None and pe.dim() == 2:
-        G = int(pe.size(0) ** 0.5)
-        state["pos_encoding"] = pe.view(G, G, -1)
     model.load_state_dict(state)
     print(f"Loaded weights from {ckpt_path}")
 
     # ── Predictions ──────────────────────────────────────────────────────
-    preds, targets, inputs, alphas = gather_predictions(model, val_loader, device)
+    preds, targets, inputs, alphas, metrics = gather_predictions(
+        model, val_loader, device,
+    )
 
     # ── 1. Accuracy summary ──────────────────────────────────────────────
-    print_accuracy_summary(preds, targets)
+    print_accuracy_summary(metrics, len(preds))
 
     # ── 2. Router summary ────────────────────────────────────────────────
     plot_router_summary(alphas, args.out_dir)

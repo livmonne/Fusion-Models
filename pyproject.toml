@@ -40,6 +40,8 @@ build-backend = "hatchling.build"
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+# Agent worktrees under .claude/ are independent checkouts; don't lint them.
+extend-exclude = [".claude"]
 
 [tool.ruff.lint]
 # Enable a broad set of rules: pyflakes (F), pycodestyle (E/W), isort (I),
