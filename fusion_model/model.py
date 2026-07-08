@@ -317,15 +317,15 @@ class FusionModel(nn.Module):
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
-    def _embed_grid(
-        self, grid: torch.Tensor, type_id: int, demo_idx: int | None = None
-    ) -> torch.Tensor:
+    def _embed_grid(self, grid: torch.Tensor, type_id: int) -> torch.Tensor:
         """Embed a padded grid into a sequence of token vectors.
+
+        Demo grids additionally receive a demo-index embedding, added by
+        the caller (vectorised over all demos in the batched encoder
+        pass).
 
         :param grid: ``(batch, H, W)`` int tensor.
         :param type_id: Type embedding index (0=demo_in, 1=demo_out, 2=test_in).
-        :param demo_idx: Demonstration index for demo grids (adds the
-            demo-index embedding); ``None`` for the test input.
         :return: ``(batch, H*W, embed_dim)`` token embeddings.
         """
         B, H, W = grid.shape
@@ -336,11 +336,6 @@ class FusionModel(nn.Module):
         tokens = tokens + self.type_embed(
             torch.full((1,), type_id, device=grid.device, dtype=torch.long)
         )
-        if demo_idx is not None:
-            idx = min(demo_idx, self.max_demos - 1)
-            tokens = tokens + self.demo_idx_embed(
-                torch.full((1,), idx, device=grid.device, dtype=torch.long)
-            )
         return tokens
 
     def _cross_attend(
@@ -552,44 +547,51 @@ class FusionModel(nn.Module):
         demo_outputs = demo_outputs[:, :D_eff]
         demo_mask = demo_mask[:, :D_eff]
 
-        # ── 1. Encode each demo pair ─────────────────────────────────────
-        demo_blocks: list[torch.Tensor] = []
-        demo_pooled: list[torch.Tensor] = []
-        ctx_invalid_blocks: list[torch.Tensor] = []
+        # ── 1. Encode all demo pairs in one batched pass ─────────────────
+        # All demo pairs are folded into the batch dimension and run
+        # through the encoder once (instead of a Python loop with D
+        # sequential encoder calls) — a ~D× throughput gain on
+        # accelerators.  Row order is (b, d) with d fastest, so demo d's
+        # tokens occupy the contiguous block [d·2HW, (d+1)·2HW) within
+        # each sample's context — the layout the verification step relies
+        # on when excluding a held-out demo.
+        flat_in = demo_inputs.reshape(B * D_eff, H, W)
+        flat_out = demo_outputs.reshape(B * D_eff, H, W)
+        inp_emb = self._embed_grid(flat_in, type_id=0)
+        out_emb = self._embed_grid(flat_out, type_id=1)
+        pair_emb = torch.cat([inp_emb, out_emb], dim=1)  # (B*D, 2HW, E)
 
-        for d in range(D_eff):
-            inp_emb = self._embed_grid(demo_inputs[:, d], type_id=0, demo_idx=d)
-            out_emb = self._embed_grid(demo_outputs[:, d], type_id=1, demo_idx=d)
-            pair_emb = torch.cat([inp_emb, out_emb], dim=1)  # (B, 2HW, E)
+        # Demo-index embedding (same index for both halves of a pair).
+        demo_ids = torch.arange(D_eff, device=device).clamp(
+            max=self.max_demos - 1
+        ).repeat(B)  # (B*D,)
+        pair_emb = pair_emb + self.demo_idx_embed(demo_ids).unsqueeze(1)
 
-            cell_valid = torch.cat(
-                [
-                    demo_inputs[:, d].reshape(B, -1) >= 0,
-                    demo_outputs[:, d].reshape(B, -1) >= 0,
-                ],
-                dim=1,
-            )  # (B, 2HW)
+        cell_valid = torch.cat(
+            [flat_in.reshape(B * D_eff, -1) >= 0,
+             flat_out.reshape(B * D_eff, -1) >= 0],
+            dim=1,
+        )  # (B*D, 2HW)
+        flat_demo_valid = demo_mask.reshape(B * D_eff)  # (B*D,)
 
-            # Encoder key-padding mask.  For samples where this demo slot
-            # is entirely absent every key would be masked (NaN), so those
-            # rows run unmasked and are excluded downstream instead.
-            enc_invalid = ~cell_valid
-            enc_invalid[~demo_mask[:, d]] = False
-            pair_encoded = self.demo_encoder(
-                pair_emb, src_key_padding_mask=enc_invalid,
-            )
+        # Encoder key-padding mask.  For absent demo slots every key
+        # would be masked (NaN), so those rows run unmasked and are
+        # excluded downstream instead.
+        enc_invalid = ~cell_valid
+        enc_invalid[~flat_demo_valid] = False
+        pair_encoded = self.demo_encoder(
+            pair_emb, src_key_padding_mask=enc_invalid,
+        )  # (B*D, 2HW, E)
 
-            demo_blocks.append(pair_encoded)
-            demo_pooled.append(masked_mean(pair_encoded, cell_valid))
-            # Context tokens are invalid if the cell is padding or the
-            # whole demo slot is absent for that sample.
-            ctx_invalid_blocks.append(
-                (~cell_valid) | (~demo_mask[:, d]).unsqueeze(1)
-            )
-
-        demo_context = torch.cat(demo_blocks, dim=1)          # (B, D*2HW, E)
-        context_invalid = torch.cat(ctx_invalid_blocks, dim=1)  # (B, D*2HW)
-        demo_pooled_stack = torch.stack(demo_pooled, dim=1)    # (B, D, E)
+        demo_context = pair_encoded.reshape(B, D_eff * 2 * H * W, -1)
+        # Context tokens are invalid if the cell is padding or the whole
+        # demo slot is absent for that sample.
+        context_invalid = (
+            (~cell_valid) | (~flat_demo_valid).unsqueeze(1)
+        ).reshape(B, D_eff * 2 * H * W)
+        demo_pooled_stack = masked_mean(pair_encoded, cell_valid).reshape(
+            B, D_eff, -1
+        )  # (B, D, E)
 
         # ── 2. Task embedding t (from demos only) ────────────────────────
         t = self._pool_task(demo_pooled_stack, demo_mask)  # (B, E)

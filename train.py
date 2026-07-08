@@ -504,13 +504,19 @@ def main() -> None:
     torch.manual_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
-    )
+    # Detect available accelerator: TPU (XLA) → CUDA → Apple MPS → CPU.
+    try:
+        import torch_xla.core.xla_model as xm  # type: ignore[import-untyped]
+
+        device = xm.xla_device()
+    except ImportError:
+        device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps"
+            if torch.backends.mps.is_available()
+            else "cpu"
+        )
     print(f"Device: {device}")
     print("Loading datasets...")
 

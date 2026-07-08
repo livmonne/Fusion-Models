@@ -30,3 +30,6 @@ Thumbs.db
 *.egg-info/
 dist/
 build/
+
+# Claude Code agent worktrees (local working copies, not project content)
+.claude/worktrees/
